@@ -487,6 +487,154 @@ describe('CreateOrUpdateOrganizationParametersUseCase — BYOK write path', () =
         });
     });
 
+    // The enterprise routing tab rebuilds `routing` from its four fields and
+    // cannot see the chain's tail, so the server merges before it validates.
+    describe('fallback chain: merge, then validate', () => {
+        const chainConfig = (
+            routing: BYOKConfig['routing'],
+            modelIds: string[] = ['model-a', 'model-b', 'model-c', 'model-d'],
+        ): BYOKConfig =>
+            v2({
+                credentials: [
+                    { id: 'cred-openai', provider: 'openai', apiKey: 'sk-x' },
+                    { id: 'cred-kodus', provider: BYOKProvider.KODUS },
+                ],
+                models: [
+                    ...modelIds.map((id) => ({
+                        id,
+                        credentialId: 'cred-openai',
+                        model: 'gpt-5',
+                    })),
+                    { id: 'model-k', credentialId: 'cred-kodus', model: 'k' },
+                ],
+                routing,
+            });
+        const stored = chainConfig({
+            defaultModelId: 'model-a',
+            fallbackModelId: 'model-b',
+            fallbackModelIds: ['model-b', 'model-c', 'model-d'],
+        });
+
+        it('a routing-tab save keeps the stored tail', async () => {
+            const { useCase, persisted } = buildUseCase(stored);
+            await saveByok(
+                useCase,
+                chainConfig({ defaultModelId: 'model-a', fallbackModelId: 'model-b' }),
+            );
+            expect(persisted.value.routing).toEqual({
+                defaultModelId: 'model-a',
+                fallbackModelId: 'model-b',
+                fallbackModelIds: ['model-b', 'model-c', 'model-d'],
+            });
+        });
+
+        it('"no fallback" on a routing-tab save clears the whole chain', async () => {
+            const { useCase, persisted } = buildUseCase(stored);
+            await saveByok(useCase, chainConfig({ defaultModelId: 'model-a' }));
+            expect(persisted.value.routing).toEqual({
+                defaultModelId: 'model-a',
+            });
+        });
+
+        it('prunes a stale stored tail entry instead of rejecting the save, with a warn', async () => {
+            const { useCase, persisted, createOrUpdateConfig } =
+                buildUseCase(stored);
+            // model-d was removed from models[] by this very save.
+            await expect(
+                saveByok(
+                    useCase,
+                    chainConfig(
+                        { defaultModelId: 'model-a', fallbackModelId: 'model-b' },
+                        ['model-a', 'model-b', 'model-c'],
+                    ),
+                ),
+            ).resolves.toBe(true);
+            expect(createOrUpdateConfig).toHaveBeenCalled();
+            expect(persisted.value.routing.fallbackModelIds).toEqual([
+                'model-b',
+                'model-c',
+            ]);
+            const warn = (useCase as any).logger.warn as jest.Mock;
+            const logged = warn.mock.calls.find(([entry]) =>
+                /fallback chain tail/.test(entry.message),
+            )?.[0];
+            expect(logged.metadata).toMatchObject({
+                organizationId: 'org-1',
+                previousTail: ['model-c', 'model-d'],
+                tail: ['model-c'],
+                pruned: [{ modelId: 'model-d', reason: 'unknown-model' }],
+            });
+        });
+
+        it('rejects an unknown id the request supplies explicitly', async () => {
+            const { useCase, createOrUpdateConfig } = buildUseCase(stored);
+            await expect(
+                saveByok(
+                    useCase,
+                    chainConfig({
+                        fallbackModelId: 'model-b',
+                        fallbackModelIds: ['model-b', 'model-ghost'],
+                    }),
+                ),
+            ).rejects.toBeInstanceOf(BadRequestException);
+            expect(createOrUpdateConfig).not.toHaveBeenCalled();
+        });
+
+        it('rejects a chain longer than MAX_FALLBACKS', async () => {
+            const { useCase, createOrUpdateConfig } = buildUseCase(stored);
+            await expect(
+                saveByok(
+                    useCase,
+                    chainConfig({
+                        fallbackModelIds: ['model-a', 'model-b', 'model-c', 'model-d'],
+                    }),
+                ),
+            ).rejects.toBeInstanceOf(BadRequestException);
+            expect(createOrUpdateConfig).not.toHaveBeenCalled();
+        });
+
+        it('rejects a Kodus-funded model in the tail', async () => {
+            const { useCase, createOrUpdateConfig } = buildUseCase(stored);
+            await expect(
+                saveByok(
+                    useCase,
+                    chainConfig({
+                        fallbackModelIds: ['model-b', 'model-k'],
+                    }),
+                ),
+            ).rejects.toThrow(/only be the first fallback/);
+            expect(createOrUpdateConfig).not.toHaveBeenCalled();
+        });
+
+        it('allows a Kodus-funded model as the head', async () => {
+            const { useCase, persisted } = buildUseCase(stored);
+            await saveByok(
+                useCase,
+                chainConfig({ fallbackModelIds: ['model-k', 'model-b'] }),
+            );
+            expect(persisted.value.routing.fallbackModelId).toBe('model-k');
+        });
+
+        it('a legacy single-fallback save is persisted in its old shape, without a warn', async () => {
+            const legacy = chainConfig({
+                defaultModelId: 'model-a',
+                fallbackModelId: 'model-b',
+            });
+            const { useCase, persisted } = buildUseCase(legacy);
+            await saveByok(useCase, legacy);
+            expect(persisted.value.routing).toEqual({
+                defaultModelId: 'model-a',
+                fallbackModelId: 'model-b',
+            });
+            const warn = (useCase as any).logger.warn as jest.Mock;
+            expect(
+                warn.mock.calls.some(([entry]) =>
+                    /fallback chain/.test(entry.message),
+                ),
+            ).toBe(false);
+        });
+    });
+
     // SSRF: a credential's baseURL is a user-controlled outbound target the
     // server calls at review time. The save path must reject unsafe URLs, not
     // rely on the (client-triggered, skippable) test-connection probe.

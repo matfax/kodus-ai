@@ -78,9 +78,18 @@ export interface BYOKRouting {
     taskOverrides?: Partial<Record<LlmTask, string>>;
     /** Default model id when a task has no explicit override. */
     defaultModelId?: string;
-    /** Single fallback model id used when the resolved tier fails the capability
-     *  gate and no higher-precedence capable model exists (REQ-ROUTE-01). */
+    /** The HEAD of the fallback chain: the model used when the resolved tier
+     *  fails the capability gate and no higher-precedence capable model exists
+     *  (REQ-ROUTE-01), and the first model a failed call cascades to. Kept for
+     *  every reader that predates the chain (the enterprise routing tab, the
+     *  audit log); after a write it always equals `fallbackModelIds[0]`. */
     fallbackModelId?: string;
+    /** The ordered fallback CHAIN (`models[]` ids, at most MAX_FALLBACKS), head
+     *  first. Stored only when the chain has more than one entry, so a
+     *  single-fallback config keeps its old shape. Read it through
+     *  `fallbackChainOf` (byok-fallback-chain.ts), never directly: that is
+     *  where the head, dedupe and cap rules live. */
+    fallbackModelIds?: string[];
 }
 
 export interface BYOKConfig {
