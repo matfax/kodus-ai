@@ -4,7 +4,9 @@
  * The error classifier is MOCKED so these tests pin the primitive's OWN logic
  * (which category cascades, the loop, the unsafe-to-retry veto) independent of
  * the status→category mapping, which `error-classifier.spec.ts` owns. Categories
- * are carried on the thrown error as `__cat` and abort as `__abort`.
+ * are carried on the thrown error as `__cat`, a caller abort as `__abort` and a
+ * provider timeout as `__providerTimeout`. `__legacyAbort` drives the prose gate
+ * that `LLM_PROVIDER_TIMEOUT_CASCADE=off` restores.
  */
 // One stable spy per module load (the factory closes over it and `createLogger`
 // always returns it) so tests can assert the [LLM-ERROR]/[LLM-SUCCESS]
@@ -42,12 +44,16 @@ jest.mock('@libs/llm/error-classifier', () => {
         LlmErrorCategory,
         classifyLLMError: (e: any) => ({ category: e?.__cat ?? 'UNKNOWN' }),
         isTerminalCategory: (c: string) => TERMINAL.has(c),
-        isAbortOrHardTimeout: (e: any) => e?.__abort === true,
+        isAbortOrHardTimeout: (e: any) =>
+            e?.__abort === true || e?.__legacyAbort === true,
+        isCallerAbortOrBudget: (e: any) => e?.__abort === true,
+        isProviderTimeout: (e: any) => e?.__providerTimeout === true,
         retriesWereExhausted: (e: any) => e?.__exhausted === true,
     };
 });
 
 import {
+    providerTimeoutCascadeEnabled,
     readAttemptedSlot,
     recordModelFailovers,
     runWithModelFailover,
@@ -120,6 +126,79 @@ describe('shouldFailoverToNextModel', () => {
             shouldFailoverToNextModel(err('TRANSIENT', { __abort: true })),
         ).toBe(false);
     });
+
+    it('cascades on a provider timeout whatever its category reads', () => {
+        // A 504/408/undici timeout is the route being down, not the budget.
+        expect(
+            shouldFailoverToNextModel(
+                err('UNKNOWN', { __providerTimeout: true }),
+            ),
+        ).toBe(true);
+    });
+
+    it('lets a caller abort win over a provider timeout it wraps', () => {
+        expect(
+            shouldFailoverToNextModel(
+                err('TRANSIENT', { __abort: true, __providerTimeout: true }),
+            ),
+        ).toBe(false);
+    });
+
+    it('does not read the prose gate while the cascade is on', () => {
+        // The old regex matched "Gateway Timeout"; it no longer vetoes.
+        expect(
+            shouldFailoverToNextModel(
+                err('TRANSIENT', { __legacyAbort: true }),
+            ),
+        ).toBe(true);
+    });
+
+    describe('LLM_PROVIDER_TIMEOUT_CASCADE=off', () => {
+        const saved = process.env.LLM_PROVIDER_TIMEOUT_CASCADE;
+        beforeEach(() => {
+            process.env.LLM_PROVIDER_TIMEOUT_CASCADE = 'off';
+        });
+        afterEach(() => {
+            if (saved === undefined) {
+                delete process.env.LLM_PROVIDER_TIMEOUT_CASCADE;
+            } else {
+                process.env.LLM_PROVIDER_TIMEOUT_CASCADE = saved;
+            }
+        });
+
+        it('restores the prose gate and ignores the provider-timeout predicate', () => {
+            expect(
+                shouldFailoverToNextModel(
+                    err('TRANSIENT', { __legacyAbort: true }),
+                ),
+            ).toBe(false);
+            expect(
+                shouldFailoverToNextModel(
+                    err('UNKNOWN', { __providerTimeout: true }),
+                ),
+            ).toBe(false);
+            expect(shouldFailoverToNextModel(err('TRANSIENT'))).toBe(true);
+        });
+    });
+});
+
+describe('providerTimeoutCascadeEnabled', () => {
+    it.each([
+        [undefined, true],
+        ['', true],
+        ['on', true],
+        ['true', true],
+        ['off', false],
+        [' OFF ', false],
+        ['false', false],
+        ['0', false],
+    ])('LLM_PROVIDER_TIMEOUT_CASCADE=%p → %p', (value, expected) => {
+        expect(
+            providerTimeoutCascadeEnabled({
+                LLM_PROVIDER_TIMEOUT_CASCADE: value,
+            }),
+        ).toBe(expected);
+    });
 });
 
 describe('runWithModelFailover', () => {
@@ -171,6 +250,27 @@ describe('runWithModelFailover', () => {
             runWithModelFailover([slot('A'), slot('B')], runOne, opts),
         ).rejects.toThrow('boom:AUTH_INVALID');
         expect(runOne).toHaveBeenCalledTimes(1);
+    });
+
+    it('tells each attempt whether a later entry will run (hasNext)', async () => {
+        const seen: boolean[] = [];
+        const runOne = jest.fn(
+            async (_s: unknown, c: FailoverAttemptControl) => {
+                seen.push(c.hasNext);
+                throw err('TRANSIENT');
+            },
+        );
+        await expect(
+            runWithModelFailover([slot('A'), slot('B')], runOne, opts),
+        ).rejects.toThrow('boom:TRANSIENT');
+        expect(seen).toEqual([true, false]);
+
+        // A fallback deduped away is no next entry.
+        seen.length = 0;
+        await expect(
+            runWithModelFailover([slot('A'), slot('A')], runOne, opts),
+        ).rejects.toThrow('boom:TRANSIENT');
+        expect(seen).toEqual([false]);
     });
 
     it('re-throws the LAST error when both the primary and fallback fail', async () => {

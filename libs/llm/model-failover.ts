@@ -23,6 +23,8 @@ import type { NormalizedModel } from '@libs/llm/byok-config';
 import {
     classifyLLMError,
     isAbortOrHardTimeout,
+    isCallerAbortOrBudget,
+    isProviderTimeout,
     isTerminalCategory,
     LlmErrorCategory,
     retriesWereExhausted,
@@ -68,12 +70,27 @@ export async function recordModelFailovers<T>(
  *    for a real rate limit, so outliving it disproves the label (see
  *    `retriesWereExhausted`).
  *  - CONTEXT_OVERFLOW — the prompt is too big; a same-class fallback won't fit it.
- *  - Abort / hard-timeout — the failure is latency or a cancel, not the model;
- *    re-running burns the whole timeout budget again.
+ *  - A caller abort or a Kodus budget (hard-timeout race, limiter queue
+ *    timeout) — the failure is a cancel or a spent budget, not the model; the
+ *    next model would inherit the same spent budget.
  *  - UNKNOWN — unclassified; stay conservative rather than spend a 2nd billed call.
+ *
+ * A PROVIDER timeout (504/408/524, an undici timeout, our round-trip deadline)
+ * is the opposite case and does cascade: the route is down, not the budget.
+ * `LLM_PROVIDER_TIMEOUT_CASCADE=off` restores the old prose gate, which could
+ * not tell the two apart.
  */
 export function shouldFailoverToNextModel(err: unknown): boolean {
-    if (isAbortOrHardTimeout(err)) {
+    if (providerTimeoutCascadeEnabled()) {
+        // The caller check runs first: a cancel wrapped around a provider
+        // timeout is still a cancel.
+        if (isCallerAbortOrBudget(err)) {
+            return false;
+        }
+        if (isProviderTimeout(err)) {
+            return true;
+        }
+    } else if (isAbortOrHardTimeout(err)) {
         return false;
     }
     const { category } = classifyLLMError(err);
@@ -113,8 +130,28 @@ export function shouldFailoverToNextModel(err: unknown): boolean {
     }
 }
 
+/**
+ * Kill switch for the provider-timeout cascade. On by default (it is a bug
+ * fix); `LLM_PROVIDER_TIMEOUT_CASCADE=off` puts back the prose gate
+ * (`isAbortOrHardTimeout`) both here and in the one-shot D-00c re-issue. Read
+ * per call, so no module state caches a stale value.
+ */
+export function providerTimeoutCascadeEnabled(
+    env: Readonly<Record<string, string | undefined>> = process.env,
+): boolean {
+    const raw = env.LLM_PROVIDER_TIMEOUT_CASCADE?.trim().toLowerCase();
+    return !(raw === 'off' || raw === 'false' || raw === '0');
+}
+
 /** Handed to each attempt so it can veto its own retry. */
 export interface FailoverAttemptControl {
+    /**
+     * True when a later chain entry will run if this attempt fails in a
+     * cascade-worthy way. The one-shot D-00c re-issue reads it: a provider
+     * timeout is thrown to the next entry instead of being re-issued on the
+     * same stalled route.
+     */
+    readonly hasNext: boolean;
     /**
      * Mark THIS attempt as no longer safely restartable — it has emitted output a
      * fresh run would DUPLICATE (an agent-loop step already ran + mutated shared
@@ -224,6 +261,7 @@ export async function runWithModelFailover<T>(
     for (let i = 0; i < attempts.length; i++) {
         let unsafeToRetry = false;
         const control: FailoverAttemptControl = {
+            hasNext: i < attempts.length - 1,
             markUnsafeToRetry: () => {
                 unsafeToRetry = true;
             },

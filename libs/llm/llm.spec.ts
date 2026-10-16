@@ -30,6 +30,8 @@ jest.mock('@libs/llm/error-classifier', () => ({
     classifyLLMError: (e: any) => ({ category: e?.__cat ?? 'UNKNOWN' }),
     isTerminalCategory: (c: string) => c === 'AUTH_INVALID',
     isAbortOrHardTimeout: (e: any) => !!e?.__abort,
+    isCallerAbortOrBudget: (e: any) => !!e?.__abort,
+    isProviderTimeout: (e: any) => !!e?.__providerTimeout,
 }));
 
 const runStructuredReviewCall = jest.fn();
@@ -111,6 +113,42 @@ describe('LLM.run — one-shot failover wiring', () => {
         // primary then fallback, each injected as byokConfig
         expect(runTextReviewCall.mock.calls[0][0].byokConfig.model).toBe('primary');
         expect(runTextReviewCall.mock.calls[1][0].byokConfig.model).toBe('fallback');
+    });
+
+    it('tells each one-shot attempt whether a next model exists (hasNextModel)', async () => {
+        // D-00c reads it: a provider timeout goes to the next entry instead of
+        // being re-issued on the stalled route.
+        runTextReviewCall
+            .mockRejectedValueOnce(transientErr())
+            .mockResolvedValueOnce('from-fallback');
+
+        await LLM.run({
+            byokConfig: slotWithFallback,
+            user: 'hi',
+            runName: 'r',
+        });
+
+        expect(runTextReviewCall.mock.calls[0][0].hasNextModel).toBe(true);
+        expect(runTextReviewCall.mock.calls[1][0].hasNextModel).toBe(false);
+
+        runTextReviewCall.mockReset().mockResolvedValueOnce('solo');
+        await LLM.run({ byokConfig: bareSlot, user: 'hi', runName: 'r' });
+        expect(runTextReviewCall.mock.calls[0][0].hasNextModel).toBe(false);
+    });
+
+    it('cascades a provider timeout to the fallback', async () => {
+        runTextReviewCall
+            .mockRejectedValueOnce(
+                Object.assign(new Error('Gateway Timeout'), {
+                    __cat: 'TRANSIENT',
+                    __providerTimeout: true,
+                }),
+            )
+            .mockResolvedValueOnce('from-fallback');
+
+        await expect(
+            LLM.run({ byokConfig: slotWithFallback, user: 'hi', runName: 'r' }),
+        ).resolves.toBe('from-fallback');
     });
 
     it('does not cascade when there is no fallback on the slot', async () => {

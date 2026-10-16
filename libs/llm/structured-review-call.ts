@@ -70,7 +70,10 @@ import { zodToStrictWireSchema } from '@libs/llm/strict-wire-schema';
 import {
     classifyLLMError,
     isAbortOrHardTimeout,
+    isCallerAbortOrBudget,
+    isProviderTimeout,
 } from '@libs/llm/error-classifier';
+import { providerTimeoutCascadeEnabled } from '@libs/llm/model-failover';
 import {
     RETRYABLE_CATEGORY,
     jitteredBackoffMs,
@@ -136,6 +139,10 @@ export interface BaseReviewCallParams {
      *  a bare `[]` for "no violations" at scale (#1786 / prod audit 2026-09) —
      *  turning a shard error (and a false "rules not applied") into a clean pass. */
     recoverEnvelopeShape?: boolean;
+    /** Set by `LLM.run` per failover attempt: a later chain entry runs if this
+     *  call fails. D-00c then throws a provider timeout to that entry instead
+     *  of re-issuing it on the same stalled route. Unset → single entry. */
+    hasNextModel?: boolean;
 }
 
 export interface StructuredReviewCallParams<
@@ -352,6 +359,7 @@ async function runReviewCall<T>(
         maxOutputTokens: maxOutputTokensOverride,
         providerOptions: providerOptionsOverride,
         suppressReasoning: callerSuppressReasoning,
+        hasNextModel,
     } = params;
 
     const mainSlot = byokConfig;
@@ -767,12 +775,25 @@ async function runReviewCall<T>(
         // (no 2nd model — attrs.fallback stays false).
         const category = classifyLLMError(err).category;
 
-        // Preserved verbatim (Phase 0 Pitfall 3): a genuinely aborted /
-        // hard-timed-out call is NEVER re-issued — classifyLLMError lumps
-        // AbortError / [HARD-TIMEOUT] into TRANSIENT, yet re-running a slow /
-        // already-timed-out call just burns the whole 10-min budget again. The
-        // re-issue reuses the same call() closure and its existing
-        // timeoutSignal(LLM_CALL_TIMEOUT_MS)/hardTimeout chain — no fresh budget.
+        // Phase 0 Pitfall 3: a genuinely aborted / hard-timed-out call is NEVER
+        // re-issued — classifyLLMError lumps AbortError / [HARD-TIMEOUT] into
+        // TRANSIENT, yet re-running a slow / already-timed-out call just burns
+        // the whole 10-min budget again. The re-issue reuses the same call()
+        // closure and its existing timeoutSignal(LLM_CALL_TIMEOUT_MS)/hardTimeout
+        // chain — no fresh budget.
+        if (providerTimeoutCascadeEnabled()) {
+            if (isCallerAbortOrBudget(err)) {
+                throw err;
+            }
+            // A provider timeout with a next chain entry goes to that entry:
+            // re-issuing on the route that just stalled only delays the cascade.
+            if (hasNextModel && isProviderTimeout(err)) {
+                throw err;
+            }
+        }
+        // Today's rule for everything else, kept as is: with no next entry a
+        // JSON-bodied 504 still gets its one re-issue, while an empty/HTML 504
+        // (message "Gateway Timeout") still does not.
         if (isAbortOrHardTimeout(err)) {
             throw err;
         }

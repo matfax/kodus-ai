@@ -50,7 +50,10 @@ import {
 /** The raw AI SDK result an agent-loop call returns (steps / usage / text). */
 export type AgentLoopResult = Awaited<ReturnType<typeof generateText>>;
 
-export interface LlmRequest extends Omit<BaseReviewCallParams, 'byokConfig' | 'user'> {
+export interface LlmRequest extends Omit<
+    BaseReviewCallParams,
+    'byokConfig' | 'user' | 'hasNextModel'
+> {
     /** A pre-resolved slot — the caller already routed task → slot. */
     byokConfig?: NormalizedModel;
     /** OR route here: the org's stored BYOK config + the task. Pure routing. */
@@ -118,7 +121,7 @@ function resolveSlot(req: LlmRequest): NormalizedModel | undefined {
  */
 function toExecutorParams(
     req: LlmRequest,
-): Omit<BaseReviewCallParams, 'byokConfig'> {
+): Omit<BaseReviewCallParams, 'byokConfig' | 'hasNextModel'> {
     const {
         config: _config,
         task: _task,
@@ -134,7 +137,7 @@ function toExecutorParams(
         // one-shot executor honors them as fixed-tuning overrides (demo paths).
         ...rest
     } = req;
-    return rest as Omit<BaseReviewCallParams, 'byokConfig'>;
+    return rest as Omit<BaseReviewCallParams, 'byokConfig' | 'hasNextModel'>;
 }
 
 /**
@@ -219,14 +222,17 @@ export class LLM {
         // Pull the schema out first so a text call can never carry a stray
         // `schema` prop into the text executor. One-shot calls are atomic, so they
         // never veto failover — a primary failure re-issues cleanly on the fallback.
+        // `hasNextModel` tells D-00c whether a provider timeout has somewhere
+        // to cascade, so it throws instead of re-issuing on the stalled route.
         const { schema, ...rest } = req;
         const baseParams = toExecutorParams(rest);
         return runWithModelFailover(
             attempts,
-            (attemptSlot) => {
+            (attemptSlot, control) => {
                 const params: BaseReviewCallParams = {
                     ...baseParams,
                     byokConfig: attemptSlot,
+                    hasNextModel: control.hasNext,
                 };
                 return schema
                     ? runStructuredReviewCall({ ...params, schema })

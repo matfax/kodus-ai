@@ -3,6 +3,7 @@ import {
     AgentContextWindowTooSmallError,
     AgentPromptTooLargeError,
 } from './errors';
+import { isProviderDeadlineError } from './provider-deadline-error';
 
 /**
  * Canonical categories for LLM/provider errors surfaced when calling a model.
@@ -117,7 +118,12 @@ export function classifyLLMError(
         extractErrorText(err).toLowerCase() || rawMessage.toLowerCase();
     const httpStatus = extractHttpStatus(err);
 
-    let category = matchByHttpStatus(httpStatus, lower);
+    // Our own round-trip deadline is a provider that did not answer: transient,
+    // whatever its message says. Read from the chain so a RetryError carrying
+    // one as its last attempt classifies the same way.
+    let category = failureChain(err).some(isProviderDeadlineError)
+        ? LlmErrorCategory.TRANSIENT
+        : matchByHttpStatus(httpStatus, lower);
     if (category === LlmErrorCategory.UNKNOWN) {
         category = matchByMessage(lower);
     }
@@ -151,6 +157,13 @@ export function classifyLLMError(
  * slow / already-cancelled call just burns the whole timeout budget again (the
  * failure mode is latency, not fidelity). Both the one-shot D-00c re-issue and
  * the runtime model-failover carve these back out of "transient" with this gate.
+ *
+ * LEGACY gate, kept only for `LLM_PROVIDER_TIMEOUT_CASCADE=off` and for the
+ * single-entry D-00c rule. It reads prose, so it also swallows a provider that
+ * timed out: the SDK turns an empty or HTML 504 into an APICallError whose
+ * message is the status phrase "Gateway Timeout", which this matches, so the
+ * org's fallback never ran. `isCallerAbortOrBudget` / `isProviderTimeout` split
+ * the two by reading fields instead.
  * Pure — safe in any catch block.
  */
 export function isAbortOrHardTimeout(err: unknown): boolean {
@@ -158,6 +171,132 @@ export function isAbortOrHardTimeout(err: unknown): boolean {
     if ((err as { name?: string }).name === 'AbortError') return true;
     const text = err instanceof Error ? err.message : String(err ?? '');
     return /\[HARD-TIMEOUT\]|aborted|timed?\s*out|timeout/i.test(text);
+}
+
+/** How far `failureChain` follows wrappers. Real chains are at most
+ *  RetryError → APICallError → undici cause; the cap bounds anything deeper. */
+const FAILURE_CHAIN_DEPTH = 4;
+
+/**
+ * Every error a failure is made of, outermost first: the error itself, then
+ * the AI SDK RetryError's `lastError` (and `errors.at(-1)`, the same attempt on
+ * SDK versions that only set the array), then `cause`, recursively.
+ *
+ * The timeout predicates below need this because the fact they read sits on
+ * whichever layer produced it: the status on the APICallError inside a
+ * RetryError, the undici code on the APICallError's `cause`.
+ */
+export function failureChain(err: unknown): object[] {
+    const out: object[] = [];
+    const visit = (e: unknown, depth: number): void => {
+        if (!e || typeof e !== 'object' || depth >= FAILURE_CHAIN_DEPTH) {
+            return;
+        }
+        if (out.includes(e)) return;
+        out.push(e);
+        const layer = e as {
+            lastError?: unknown;
+            errors?: unknown;
+            cause?: unknown;
+        };
+        visit(layer.lastError, depth + 1);
+        if (Array.isArray(layer.errors)) {
+            visit(layer.errors.at(-1), depth + 1);
+        }
+        visit(layer.cause, depth + 1);
+    };
+    visit(err, 0);
+    return out;
+}
+
+/** The names the AI SDK's own `isAbortError` treats as a cancel: a fired
+ *  AbortSignal (`AbortError`), `AbortSignal.timeout` (`TimeoutError`) and
+ *  Next.js (`ResponseAborted`). */
+const CALLER_ABORT_NAMES = new Set([
+    'AbortError',
+    'TimeoutError',
+    'ResponseAborted',
+]);
+
+/** Markers Kodus puts on its OWN budget failures: the executor's hard-timeout
+ *  race and the BYOK limiter giving up on a queued call. Matched anywhere in
+ *  the message, so a RetryError quoting one ("Last error: [BYOK-QUEUE-TIMEOUT]
+ *  …") is still read as ours. */
+const CALLER_BUDGET_MARKERS = [
+    '[HARD-TIMEOUT]',
+    '[BYOK-QUEUE-TIMEOUT]',
+    '[BYOK-QUEUE-ABORTED]',
+];
+
+/**
+ * True when the call was cancelled or ran out of a budget Kodus or its caller
+ * set — never the provider's fault, so it must not cascade or be re-issued:
+ * the next model would inherit an already-spent budget, or a cancel nobody
+ * wants overridden.
+ *
+ * Reads error names and our own markers only, on every layer of the chain.
+ * Checked BEFORE `isProviderTimeout`, so a caller abort wrapped around a
+ * provider timeout stays a caller abort.
+ * Pure — safe in any catch block.
+ */
+export function isCallerAbortOrBudget(err: unknown): boolean {
+    if (typeof err === 'string') return hasCallerBudgetMarker(err);
+    return failureChain(err).some((e) => {
+        const { name, message } = e as { name?: unknown; message?: unknown };
+        return (
+            (typeof name === 'string' && CALLER_ABORT_NAMES.has(name)) ||
+            (typeof message === 'string' && hasCallerBudgetMarker(message))
+        );
+    });
+}
+
+function hasCallerBudgetMarker(text: string): boolean {
+    return CALLER_BUDGET_MARKERS.some((marker) => text.includes(marker));
+}
+
+/** Gateway / request timeouts: 408 Request Timeout, 504 Gateway Timeout and
+ *  Cloudflare's 524 "a timeout occurred". */
+const PROVIDER_TIMEOUT_STATUSES = new Set([408, 504, 524]);
+
+/** undici's connect / headers / body timeouts and the socket-level timeout. */
+const PROVIDER_TIMEOUT_CODES = new Set([
+    'UND_ERR_CONNECT_TIMEOUT',
+    'UND_ERR_HEADERS_TIMEOUT',
+    'UND_ERR_BODY_TIMEOUT',
+    'ETIMEDOUT',
+]);
+
+/**
+ * True when the PROVIDER (or the network to it) timed out: an HTTP timeout
+ * status, an undici/socket timeout code, or Kodus's own round-trip deadline.
+ * Another model on another route can answer this, so it cascades.
+ *
+ * Reads fields only, never prose: "Gateway Timeout" is the message the SDK
+ * gives an empty-bodied 504, and the prose gate is what used to read it as a
+ * cancel. Callers check `isCallerAbortOrBudget` first.
+ * Pure — safe in any catch block.
+ */
+export function isProviderTimeout(err: unknown): boolean {
+    return failureChain(err).some((e) => {
+        if (isProviderDeadlineError(e)) return true;
+        const layer = e as {
+            status?: unknown;
+            statusCode?: unknown;
+            code?: unknown;
+            cause?: { code?: unknown } | null;
+        };
+        const status = layer.statusCode ?? layer.status;
+        if (
+            typeof status === 'number' &&
+            PROVIDER_TIMEOUT_STATUSES.has(status)
+        ) {
+            return true;
+        }
+        return [layer.code, layer.cause?.code].some(
+            (code) =>
+                typeof code === 'string' && PROVIDER_TIMEOUT_CODES.has(code),
+        );
+    });
 }
 
 /**

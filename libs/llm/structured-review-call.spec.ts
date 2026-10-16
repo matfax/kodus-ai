@@ -46,6 +46,11 @@ import {
     jsonSchema,
 } from 'ai';
 import { tracedGenerateText, timeoutSignal } from '@libs/llm/llm-call';
+import {
+    HTML_504_BODY,
+    httpProviderError,
+    jsonErrorBody,
+} from '@libs/llm/testing/provider-errors';
 import { buildProviderOptions } from '@libs/llm/reasoning-options';
 import { setLlmObservability } from '@libs/llm/llm-observability';
 import {
@@ -1084,6 +1089,104 @@ describe('runStructuredReviewCall — retained latency guard (D-00c: one gated S
 
         expect(mockGenerate).toHaveBeenCalledTimes(1);
         assertNoSecondModelBuilt();
+    });
+});
+
+describe('runStructuredReviewCall — D-00c is chain-aware (provider timeouts)', () => {
+    // Real SDK errors: the message of an empty/HTML 504 is "Gateway Timeout".
+    const json504 = () =>
+        httpProviderError(
+            504,
+            'Gateway Timeout',
+            jsonErrorBody('upstream request did not complete'),
+        );
+    const html504 = () =>
+        httpProviderError(504, 'Gateway Timeout', HTML_504_BODY);
+
+    it('single entry: a JSON-bodied 504 still gets its ONE re-issue', async () => {
+        mockGenerate
+            .mockRejectedValueOnce(await json504())
+            .mockResolvedValueOnce(ok({ violations: ['reissued'] }));
+
+        const out = await runStructuredReviewCall({ ...base });
+
+        expect(out).toEqual({ violations: ['reissued'] });
+        expect(mockGenerate).toHaveBeenCalledTimes(2);
+    });
+
+    it('with a next model: a JSON-bodied 504 is THROWN to it, not re-issued', async () => {
+        const err = await json504();
+        mockGenerate.mockRejectedValueOnce(err);
+
+        await expect(
+            runStructuredReviewCall({ ...base, hasNextModel: true }),
+        ).rejects.toBe(err);
+        expect(mockGenerate).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([false, true])(
+        'an HTML 504 is never re-issued (hasNextModel=%p)',
+        async (hasNextModel) => {
+            const err = await html504();
+            mockGenerate.mockRejectedValueOnce(err);
+
+            await expect(
+                runStructuredReviewCall({ ...base, hasNextModel }),
+            ).rejects.toBe(err);
+            expect(mockGenerate).toHaveBeenCalledTimes(1);
+        },
+    );
+
+    it('with a next model: a 503 (not a timeout) keeps its one re-issue', async () => {
+        mockGenerate
+            .mockRejectedValueOnce(
+                await httpProviderError(503, 'Service Unavailable'),
+            )
+            .mockResolvedValueOnce(ok({ violations: ['reissued'] }));
+
+        await runStructuredReviewCall({ ...base, hasNextModel: true });
+
+        expect(mockGenerate).toHaveBeenCalledTimes(2);
+    });
+
+    it.each([false, true])(
+        'a [BYOK-QUEUE-TIMEOUT] is never re-issued (hasNextModel=%p)',
+        async (hasNextModel) => {
+            mockGenerate.mockRejectedValueOnce(
+                new Error(
+                    '[BYOK-QUEUE-TIMEOUT] test.run waited more than 60s for an LLM concurrency slot',
+                ),
+            );
+
+            await expect(
+                runStructuredReviewCall({ ...base, hasNextModel }),
+            ).rejects.toThrow('[BYOK-QUEUE-TIMEOUT]');
+            expect(mockGenerate).toHaveBeenCalledTimes(1);
+        },
+    );
+
+    describe('LLM_PROVIDER_TIMEOUT_CASCADE=off', () => {
+        const saved = process.env.LLM_PROVIDER_TIMEOUT_CASCADE;
+        beforeEach(() => {
+            process.env.LLM_PROVIDER_TIMEOUT_CASCADE = 'off';
+        });
+        afterEach(() => {
+            if (saved === undefined) {
+                delete process.env.LLM_PROVIDER_TIMEOUT_CASCADE;
+            } else {
+                process.env.LLM_PROVIDER_TIMEOUT_CASCADE = saved;
+            }
+        });
+
+        it('a JSON 504 is re-issued even with a next model (the old rule)', async () => {
+            mockGenerate
+                .mockRejectedValueOnce(await json504())
+                .mockResolvedValueOnce(ok({ violations: ['reissued'] }));
+
+            await runStructuredReviewCall({ ...base, hasNextModel: true });
+
+            expect(mockGenerate).toHaveBeenCalledTimes(2);
+        });
     });
 });
 
