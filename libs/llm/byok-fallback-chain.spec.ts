@@ -136,6 +136,9 @@ describe('mergeFallbackChainOnWrite', () => {
             stored,
         );
         expect(fallbackChainOf(config.routing)).toEqual(['c', 'd']);
+        // The persisted shape, not just the normalized read, has no duplicate.
+        expect(config.routing?.fallbackModelId).toBe('c');
+        expect(config.routing?.fallbackModelIds).toEqual(['c', 'd']);
     });
 
     it('"no fallback" on a routing-tab save clears the whole chain', () => {

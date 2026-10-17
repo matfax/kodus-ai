@@ -20,25 +20,17 @@ describe('OrganizationParametersController.setByokFallbackChain', () => {
                 .fn()
                 .mockResolvedValue({ fallbackModelIds: ['model-b'] }),
         };
-        return new OrganizationParametersController(
-            undefined as any, // createOrUpdateOrganizationParametersUseCase
-            undefined as any, // findByKeyOrganizationParametersUseCase
-            undefined as any, // getModelsByProviderUseCase
-            undefined as any, // getModelCapabilitiesUseCase
-            undefined as any, // providerService
-            undefined as any, // deleteByokConfigUseCase
-            undefined as any, // getLLMConfigStatusUseCase
-            undefined as any, // getByokProvidersUseCase
-            undefined as any, // testByokConnectionUseCase
-            undefined as any, // testByokModelUseCase
-            undefined as any, // listModelOverridesUseCase
-            undefined as any, // clearModelOverridesUseCase
-            undefined as any, // getCockpitMetricsVisibilityUseCase
-            undefined as any, // ignoreBotsUseCase
-            undefined as any, // updateAutoLicenseAllowedUsersUseCase
-            { user: { organization: { uuid: orgId } } } as any, // request
-            setByokFallbackChainUseCase as any,
-        );
+        // Only the request (16th) and the chain use-case (17th, last) are
+        // touched by this route; every other dependency stays unset.
+        const unused = Array.from({ length: 15 }, () => undefined);
+        const deps = [
+            ...unused,
+            { user: { organization: { uuid: orgId } } },
+            setByokFallbackChainUseCase,
+        ] as unknown as ConstructorParameters<
+            typeof OrganizationParametersController
+        >;
+        return new OrganizationParametersController(...deps);
     }
 
     it('passes the body modelIds to the use-case, scoped to the org', async () => {
@@ -63,10 +55,12 @@ describe('OrganizationParametersController.setByokFallbackChain', () => {
     });
 
     it('runs behind PolicyGuard', () => {
-        const guards = Reflect.getMetadata(
-            GUARDS_METADATA,
-            OrganizationParametersController.prototype.setByokFallbackChain,
-        );
+        // The decorators store their metadata on the method's function object.
+        const handler = Object.getOwnPropertyDescriptor(
+            OrganizationParametersController.prototype,
+            'setByokFallbackChain',
+        )?.value as object;
+        const guards = Reflect.getMetadata(GUARDS_METADATA, handler);
         expect(guards).toContain(PolicyGuard);
     });
 

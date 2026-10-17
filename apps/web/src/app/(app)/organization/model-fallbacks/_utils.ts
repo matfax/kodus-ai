@@ -18,9 +18,7 @@ export type FallbackPoolModel = {
  * org connected. Models on a managed credential (the env default) are left out,
  * as everywhere else in the UI.
  */
-export const fallbackPool = (
-    config: BYOKConfig | null | undefined,
-): FallbackPoolModel[] => {
+export const fallbackPool = (config?: BYOKConfig): FallbackPoolModel[] => {
     const credentials = new Map(
         (config?.credentials ?? [])
             .filter((credential) => !credential.managed)

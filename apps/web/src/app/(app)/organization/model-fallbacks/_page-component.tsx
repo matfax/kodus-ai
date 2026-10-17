@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useState, type Dispatch } from "react";
 import { Badge } from "@components/ui/badge";
 import { Button } from "@components/ui/button";
 import { Card, CardContent } from "@components/ui/card";
@@ -45,7 +45,7 @@ import {
 
 /** The API's error body carries a readable `message`; anything else is generic. */
 const saveErrorMessage = (error: unknown): string => {
-    const message = isAxiosError<{ message?: unknown }>(error)
+    const message = isAxiosError<{ message?: unknown } | undefined>(error)
         ? error.response?.data?.message
         : undefined;
     return typeof message === "string" && message
@@ -72,7 +72,7 @@ const ModelFallbacksEditor = ({
     config,
     stored,
 }: {
-    config: BYOKConfig | undefined;
+    config?: BYOKConfig;
     stored: string[];
 }) => {
     // The same gate as the endpoint (and the full BYOK save).
@@ -86,7 +86,7 @@ const ModelFallbacksEditor = ({
 
     const isDirty =
         chain.length !== stored.length ||
-        chain.some((id, index) => id !== stored[index]);
+        chain.some((id, index) => id !== stored.at(index));
     const problem = chainProblem(chain, pool);
 
     useUnsavedChangesGuard({
@@ -116,7 +116,9 @@ const ModelFallbacksEditor = ({
                     isDirty={isDirty}
                     isSaving={isSaving}
                     canSave={canEdit && !problem}
-                    onReset={() => setChain(stored)}
+                    onReset={() => {
+                        setChain(stored);
+                    }}
                     onSave={save}
                     saveLabel="Save fallbacks"
                 />
@@ -187,7 +189,7 @@ const ChainCard = ({
     pool: FallbackPoolModel[];
     problem: string | null | undefined;
     disabled: boolean;
-    onChange: (chain: string[]) => void;
+    onChange: Dispatch<string[]>;
 }) => (
     <Card color="lv1">
         <CardContent className="flex flex-col gap-4 pt-6">
@@ -206,12 +208,12 @@ const ChainCard = ({
                             count={chain.length}
                             model={pool.find((m) => m.id === id)}
                             disabled={disabled}
-                            onMove={(offset) =>
-                                onChange(moveEntry(chain, index, offset))
-                            }
-                            onRemove={() =>
-                                onChange(chain.filter((entry) => entry !== id))
-                            }
+                            onMove={(offset) => {
+                                onChange(moveEntry(chain, index, offset));
+                            }}
+                            onRemove={() => {
+                                onChange(chain.filter((entry) => entry !== id));
+                            }}
                         />
                     ))}
                 </ol>
@@ -228,7 +230,9 @@ const ChainCard = ({
                 options={pool.filter((model) => !chain.includes(model.id))}
                 chainLength={chain.length}
                 disabled={disabled}
-                onAdd={(id) => onChange([...chain, id])}
+                onAdd={(id) => {
+                    onChange([...chain, id]);
+                }}
             />
         </CardContent>
     </Card>
@@ -248,7 +252,7 @@ const ChainEntry = ({
     count: number;
     model: FallbackPoolModel | undefined;
     disabled: boolean;
-    onMove: (offset: number) => void;
+    onMove: Dispatch<number>;
     onRemove: () => void;
 }) => {
     const label = model?.model ?? id;
@@ -271,7 +275,9 @@ const ChainEntry = ({
                 variant="cancel"
                 aria-label={`Move ${label} up`}
                 disabled={disabled || index === 0}
-                onClick={() => onMove(-1)}>
+                onClick={() => {
+                    onMove(-1);
+                }}>
                 <ArrowUpIcon />
             </Button>
             <Button
@@ -280,7 +286,9 @@ const ChainEntry = ({
                 variant="cancel"
                 aria-label={`Move ${label} down`}
                 disabled={disabled || index === count - 1}
-                onClick={() => onMove(1)}>
+                onClick={() => {
+                    onMove(1);
+                }}>
                 <ArrowDownIcon />
             </Button>
             <Button
@@ -305,7 +313,7 @@ const AddEntry = ({
     options: FallbackPoolModel[];
     chainLength: number;
     disabled: boolean;
-    onAdd: (id: string) => void;
+    onAdd: Dispatch<string>;
 }) => {
     const full = chainLength >= MAX_FALLBACKS;
 

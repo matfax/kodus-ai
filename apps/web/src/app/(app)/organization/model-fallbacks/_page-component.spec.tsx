@@ -48,6 +48,12 @@ const config = (routing: Record<string, unknown>): BYOKConfig => ({
 
 const saveButton = () =>
     screen.getByRole("button", { name: /save fallbacks/i });
+/** Clicks Save inside an async act, so the save's promise settles first. */
+const clickSave = () =>
+    act(() => {
+        fireEvent.click(saveButton());
+        return Promise.resolve();
+    });
 const entries = () =>
     screen.getAllByRole("listitem").map((item) => item.textContent ?? "");
 
@@ -99,9 +105,7 @@ describe("ModelFallbacksPage", () => {
 
         fireEvent.click(screen.getByRole("button", { name: "Move gpt-5 up" }));
         expect(saveButton()).toBeEnabled();
-        await act(async () => {
-            fireEvent.click(saveButton());
-        });
+        await clickSave();
 
         expect(mutateAsync).toHaveBeenCalledWith(["model-a", "model-b"]);
     });
@@ -114,9 +118,7 @@ describe("ModelFallbacksPage", () => {
             screen.getByRole("button", { name: "Remove gpt-5-mini" }),
         );
         expect(screen.getByText(/No fallback models/i)).toBeInTheDocument();
-        await act(async () => {
-            fireEvent.click(saveButton());
-        });
+        await clickSave();
 
         expect(mutateAsync).toHaveBeenCalledWith([]);
     });
@@ -131,9 +133,7 @@ describe("ModelFallbacksPage", () => {
         fireEvent.click(
             screen.getByRole("button", { name: "Remove gpt-5-mini" }),
         );
-        await act(async () => {
-            fireEvent.click(saveButton());
-        });
+        await clickSave();
 
         expect(mockToast).toHaveBeenCalledWith(
             expect.objectContaining({
@@ -151,9 +151,7 @@ describe("ModelFallbacksPage", () => {
         fireEvent.click(
             screen.getByRole("button", { name: "Remove gpt-5-mini" }),
         );
-        await act(async () => {
-            fireEvent.click(saveButton());
-        });
+        await clickSave();
 
         expect(mockToast).toHaveBeenCalledWith(
             expect.objectContaining({
