@@ -78,7 +78,9 @@ describe('slotForProbe', () => {
         tpm: 1000,
         cooldownMs: 60000,
         maxConcurrentRequests: 2,
-        fallback: { provider: 'openai', apiKey: 'x', model: 'gpt' },
+        fallbacks: [
+            { provider: 'openai', apiKey: 'x', model: 'gpt', chainIndex: 0 },
+        ],
     };
 
     it('drops the throughput policy — a rate limit must not stall the connect form', () => {
@@ -90,7 +92,7 @@ describe('slotForProbe', () => {
     });
 
     it('never probes the fallback — the Test is about the model being saved', () => {
-        expect(slotForProbe(slot).fallback).toBeUndefined();
+        expect(slotForProbe(slot).fallbacks).toBeUndefined();
     });
 
     it('keeps every field that shapes the inference itself', () => {

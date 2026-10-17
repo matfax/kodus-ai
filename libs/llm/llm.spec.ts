@@ -1,9 +1,9 @@
 /**
  * llm.spec.ts — the `LLM.run` WIRING of runtime model failover (the seam between
- * a slot's `.fallback` and the executor cascade). The executors, the classifier
+ * a slot's `.fallbacks` and the executor cascade). The executors, the classifier
  * and the logger are mocked so these tests pin only what `run` is responsible for:
- *   - build the attempts `[slot, slot.fallback]` and inject each as `byokConfig`;
- *   - cascade one-shot calls to the fallback on a cascade-worthy failure;
+ *   - build the attempts `[slot, ...slot.fallbacks]` and inject each as `byokConfig`;
+ *   - cascade one-shot calls down the chain on a cascade-worthy failure;
  *   - guard the agent loop so a step that already ran vetoes the cascade.
  * The cascade decision itself lives in `model-failover.spec.ts`.
  */
@@ -69,12 +69,29 @@ const slotWithFallback: NormalizedModel = {
     byokModelId: 'p',
     provider: 'openai',
     apiKey: 'enc',
-    fallback: {
-        model: 'fallback',
-        byokModelId: 'f',
+    fallbacks: [
+        {
+            model: 'fallback',
+            byokModelId: 'f',
+            provider: 'openai',
+            apiKey: 'enc',
+            chainIndex: 0,
+        },
+    ],
+} as any;
+
+const slotWithChain: NormalizedModel = {
+    model: 'primary',
+    byokModelId: 'p',
+    provider: 'openai',
+    apiKey: 'enc',
+    fallbacks: ['f1', 'f2', 'f3'].map((id, chainIndex) => ({
+        model: id,
+        byokModelId: id,
         provider: 'openai',
         apiKey: 'enc',
-    },
+        chainIndex,
+    })),
 } as any;
 
 const bareSlot: NormalizedModel = {
@@ -97,7 +114,7 @@ beforeEach(() => {
 });
 
 describe('LLM.run — one-shot failover wiring', () => {
-    it('cascades to slot.fallback on a cascade-worthy failure', async () => {
+    it('cascades to slot.fallbacks[0] on a cascade-worthy failure', async () => {
         runTextReviewCall
             .mockRejectedValueOnce(authErr())
             .mockResolvedValueOnce('from-fallback');
@@ -181,6 +198,44 @@ describe('LLM.run — one-shot failover wiring', () => {
         expect(out).toEqual({ ok: true });
         expect(runStructuredReviewCall).toHaveBeenCalledTimes(2);
     });
+
+    it('walks the whole chain in order, injecting each entry as byokConfig', async () => {
+        runTextReviewCall
+            .mockRejectedValueOnce(authErr())
+            .mockRejectedValueOnce(transientErr())
+            .mockRejectedValueOnce(authErr())
+            .mockResolvedValueOnce('from-f3');
+
+        const out = await LLM.run({
+            byokConfig: slotWithChain,
+            user: 'hi',
+            runName: 'r',
+        });
+
+        expect(out).toBe('from-f3');
+        expect(
+            runTextReviewCall.mock.calls.map(([p]) => [
+                p.byokConfig.model,
+                p.hasNextModel,
+            ]),
+        ).toEqual([
+            ['primary', true],
+            ['f1', true],
+            ['f2', true],
+            ['f3', false],
+        ]);
+    });
+
+    it('stops the chain at the first error that must not cascade', async () => {
+        runTextReviewCall
+            .mockRejectedValueOnce(authErr())
+            .mockRejectedValueOnce(unknownErr('opaque'));
+
+        await expect(
+            LLM.run({ byokConfig: slotWithChain, user: 'hi', runName: 'r' }),
+        ).rejects.toThrow('opaque');
+        expect(runTextReviewCall).toHaveBeenCalledTimes(2);
+    });
 });
 
 describe('LLM.run — agent-loop failover guard', () => {
@@ -212,6 +267,27 @@ describe('LLM.run — agent-loop failover guard', () => {
 
         await expect(LLM.run(loopReq as any)).rejects.toThrow('unauth');
         expect(runAgentLoopCall).toHaveBeenCalledTimes(1);
+    });
+
+    it('walks the chain before any step, and stops once the caller signal aborts', async () => {
+        const controller = new AbortController();
+        runAgentLoopCall
+            .mockRejectedValueOnce(authErr())
+            .mockImplementationOnce(() => {
+                controller.abort();
+                return Promise.reject(transientErr());
+            });
+
+        await expect(
+            LLM.run({
+                ...loopReq,
+                byokConfig: slotWithChain,
+                signal: controller.signal,
+            } as any),
+        ).rejects.toThrow('5xx');
+        expect(
+            runAgentLoopCall.mock.calls.map(([p]) => p.byokConfig.model),
+        ).toEqual(['primary', 'f1']);
     });
 });
 

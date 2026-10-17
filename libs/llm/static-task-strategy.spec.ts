@@ -317,16 +317,19 @@ describe('StaticTaskStrategy — I/O contract matrix (deterministic boundary)', 
             });
         });
 
-        it('A1: a clean fallback verdict (via resolveFallback) carries usedFallback:true and no skip prefix', () => {
-            const v = strategy.resolveFallback(
+        it('A1: a clean fallback verdict (via resolveFallbacks) carries usedFallback:true and no skip prefix', () => {
+            const { fallbacks } = strategy.resolveFallbacks(
                 'codeReview',
                 cfg({ fallbackModelId: 'm-A' }),
             );
-            expect(v).toEqual({
-                modelId: 'm-A',
-                reason: 'resolved "codeReview" via fallback to "m-A"',
-                usedFallback: true,
-            });
+            expect(fallbacks).toEqual([
+                {
+                    modelId: 'm-A',
+                    reason: 'resolved "codeReview" via fallback to "m-A"',
+                    usedFallback: true,
+                    chainIndex: 0,
+                },
+            ]);
         });
 
         it('A1: a BLOCKED resolve returns EXACTLY { modelId:null, reason } (no stray keys)', () => {
@@ -361,9 +364,9 @@ describe('StaticTaskStrategy — I/O contract matrix (deterministic boundary)', 
                 for (const c of variants) {
                     const v = strategy.resolve(t, NO_CTX, c);
                     expect(isVerdictShape(v)).toBe(true);
-                    // resolveFallback shares the shape (or undefined).
-                    const f = strategy.resolveFallback(t, c);
-                    expect(f === undefined || isVerdictShape(f)).toBe(true);
+                    // resolveFallbacks entries share the shape.
+                    const { fallbacks } = strategy.resolveFallbacks(t, c);
+                    expect(fallbacks.every(isVerdictShape)).toBe(true);
                 }
             }
         });
@@ -725,26 +728,111 @@ describe('StaticTaskStrategy — I/O contract matrix (deterministic boundary)', 
         });
     });
 
-    // ── resolveFallback contract (the runtime-failover sibling) ─────────────
-    describe('resolveFallback / runtime-failover verdict contract', () => {
-        it('returns undefined when no fallbackModelId is configured', () => {
+    // ── resolveFallbacks contract (the runtime-failover sibling) ────────────
+    describe('resolveFallbacks / runtime-failover verdict contract', () => {
+        it('returns no entries when no fallback is configured', () => {
             expect(
-                strategy.resolveFallback('codeReview', cfg({ defaultModelId: 'm-A' })),
-            ).toBeUndefined();
+                strategy.resolveFallbacks('codeReview', cfg({ defaultModelId: 'm-A' })),
+            ).toEqual({ fallbacks: [], skips: [] });
         });
 
-        it('returns undefined when the configured fallback fails the capability gate', () => {
+        it('drops an entry that fails the capability gate, with a skip reason', () => {
             // m-UK is an unregistered provider → the fallback is not offered.
-            expect(
-                strategy.resolveFallback('codeReview', cfg({ fallbackModelId: 'm-UK' })),
-            ).toBeUndefined();
+            const r = strategy.resolveFallbacks(
+                'codeReview',
+                cfg({ fallbackModelId: 'm-UK' }),
+            );
+            expect(r.fallbacks).toEqual([]);
+            expect(r.skips).toEqual([
+                expect.stringContaining('fallback "m-UK"'),
+            ]);
         });
 
         it('returns the fallback verdict (usedFallback:true) when it passes the gate', () => {
-            const v = strategy.resolveFallback('codeReview', cfg({ fallbackModelId: 'm-A' }));
+            const { fallbacks } = strategy.resolveFallbacks(
+                'codeReview',
+                cfg({ fallbackModelId: 'm-A' }),
+            );
+            expect(fallbacks).toEqual([
+                {
+                    modelId: 'm-A',
+                    reason: 'resolved "codeReview" via fallback to "m-A"',
+                    usedFallback: true,
+                    chainIndex: 0,
+                },
+            ]);
+        });
+
+        it('gates each chain entry on its own, in chain order, keeping its chain index', () => {
+            const r = strategy.resolveFallbacks(
+                'codeReview',
+                cfg({ fallbackModelIds: ['m-B', 'm-UK', 'm-MG', 'm-ANT'] }),
+            );
+            expect(r.fallbacks.map((f) => [f.modelId, f.chainIndex])).toEqual([
+                ['m-B', 0],
+            ]);
+            // Capped at MAX_FALLBACKS: m-ANT is the 4th entry and never read.
+            expect(r.skips).toEqual([
+                expect.stringMatching(/^fallback\[1\] "m-UK".*not registered/),
+                expect.stringMatching(/^fallback\[2\] "m-MG".*managed/),
+            ]);
+        });
+
+        it('names later entries fallback[i] in their reason', () => {
+            const { fallbacks } = strategy.resolveFallbacks(
+                'codeReview',
+                cfg({ fallbackModelIds: ['m-A', 'm-ANT'] }),
+            );
+            expect(fallbacks[1]).toEqual({
+                modelId: 'm-ANT',
+                reason: 'resolved "codeReview" via fallback[1] to "m-ANT"',
+                usedFallback: true,
+                chainIndex: 1,
+            });
+        });
+
+        it('returns only the entries AFTER a gate-time winner', () => {
+            const { fallbacks } = strategy.resolveFallbacks(
+                'codeReview',
+                cfg({ fallbackModelIds: ['m-A', 'm-B', 'm-ANT'] }),
+                'm-B',
+            );
+            expect(fallbacks.map((f) => f.modelId)).toEqual(['m-ANT']);
+        });
+
+        it('returns nothing after a winner that is not in the chain', () => {
+            const { fallbacks } = strategy.resolveFallbacks(
+                'codeReview',
+                cfg({ fallbackModelIds: ['m-A', 'm-B'] }),
+                'm-ghost',
+            );
+            expect(fallbacks).toEqual([]);
+        });
+    });
+
+    describe('gate-time resolve over a fallback chain', () => {
+        it('the first eligible chain entry wins when every primary tier fails', () => {
+            const v = strategy.resolve(
+                'codeReview',
+                NO_CTX,
+                cfg({ defaultModelId: 'm-UK', fallbackModelIds: ['m-MG', 'm-B'] }),
+            );
+            expect(v.modelId).toBe('m-B');
+            expect(v.usedFallback).toBe(true);
+            expect(v.reason).toMatch(/fallback "m-MG".*managed/);
+            expect(v.reason).toMatch(/via fallback\[1\] to "m-B"$/);
+        });
+
+        it('a legacy single fallback resolves exactly as before', () => {
+            const v = strategy.resolve(
+                'codeReview',
+                NO_CTX,
+                cfg({ defaultModelId: 'm-UK', fallbackModelId: 'm-A' }),
+            );
             expect(v).toEqual({
                 modelId: 'm-A',
-                reason: 'resolved "codeReview" via fallback to "m-A"',
+                reason:
+                    'default "m-UK": provider "totally-unknown-provider" not registered → resolved "codeReview" via fallback to "m-A"',
                 usedFallback: true,
             });
         });

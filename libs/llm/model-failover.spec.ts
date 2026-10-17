@@ -52,9 +52,11 @@ jest.mock('@libs/llm/error-classifier', () => {
     };
 });
 
+import { ProviderDeadlineError } from './provider-deadline-error';
 import {
     providerTimeoutCascadeEnabled,
     readAttemptedSlot,
+    readFailoverHops,
     recordModelFailovers,
     runWithModelFailover,
     shouldFailoverToNextModel,
@@ -331,6 +333,220 @@ describe('runWithModelFailover', () => {
     });
 });
 
+describe('runWithModelFailover — an N-entry chain', () => {
+    const opts = { runName: 'chain' };
+
+    it('walks every entry in order until one answers', async () => {
+        const runOne = jest
+            .fn()
+            .mockRejectedValueOnce(err('AUTH_INVALID'))
+            .mockRejectedValueOnce(err('TRANSIENT'))
+            .mockRejectedValueOnce(err('QUOTA_EXCEEDED'))
+            .mockResolvedValueOnce('from-D');
+        const out = await runWithModelFailover(
+            [slot('A'), slot('B'), slot('C'), slot('D')],
+            runOne,
+            opts,
+        );
+        expect(out).toBe('from-D');
+        expect(runOne.mock.calls.map(([s]) => s.model)).toEqual([
+            'A',
+            'B',
+            'C',
+            'D',
+        ]);
+    });
+
+    it('stops at the first error that must not cascade, mid-chain', async () => {
+        const runOne = jest
+            .fn()
+            .mockRejectedValueOnce(err('TRANSIENT'))
+            .mockRejectedValueOnce(err('CONTEXT_OVERFLOW'));
+        await expect(
+            runWithModelFailover(
+                [slot('A'), slot('B'), slot('C')],
+                runOne,
+                opts,
+            ),
+        ).rejects.toThrow('boom:CONTEXT_OVERFLOW');
+        expect(runOne).toHaveBeenCalledTimes(2);
+    });
+
+    it('tells every entry but the last that a next one exists', async () => {
+        const seen: boolean[] = [];
+        const runOne = jest.fn(
+            async (_s: unknown, c: FailoverAttemptControl) => {
+                seen.push(c.hasNext);
+                throw err('TRANSIENT');
+            },
+        );
+        await expect(
+            runWithModelFailover(
+                [slot('A'), slot('B'), slot('C')],
+                runOne,
+                opts,
+            ),
+        ).rejects.toThrow();
+        expect(seen).toEqual([true, true, false]);
+    });
+
+    it('lets markUnsafeToRetry veto the cascade on a middle entry, and isUnsafe reports it', async () => {
+        const unsafe: boolean[] = [];
+        const runOne = jest
+            .fn()
+            .mockRejectedValueOnce(err('TRANSIENT'))
+            .mockImplementationOnce(
+                async (_s: unknown, c: FailoverAttemptControl) => {
+                    unsafe.push(c.isUnsafe());
+                    c.markUnsafeToRetry();
+                    unsafe.push(c.isUnsafe());
+                    throw err('TRANSIENT');
+                },
+            );
+        await expect(
+            runWithModelFailover(
+                [slot('A'), slot('B'), slot('C')],
+                runOne,
+                opts,
+            ),
+        ).rejects.toThrow('boom:TRANSIENT');
+        expect(runOne).toHaveBeenCalledTimes(2);
+        expect(unsafe).toEqual([false, true]);
+    });
+
+    it('does not start the next entry once the caller signal has aborted', async () => {
+        const controller = new AbortController();
+        const runOne = jest.fn(async () => {
+            controller.abort();
+            throw err('TRANSIENT');
+        });
+        await expect(
+            runWithModelFailover([slot('A'), slot('B'), slot('C')], runOne, {
+                ...opts,
+                signal: controller.signal,
+            }),
+        ).rejects.toThrow('boom:TRANSIENT');
+        expect(runOne).toHaveBeenCalledTimes(1);
+    });
+
+    it('stops between later hops too when the caller aborts', async () => {
+        const controller = new AbortController();
+        const runOne = jest
+            .fn()
+            .mockRejectedValueOnce(err('TRANSIENT'))
+            .mockImplementationOnce(async () => {
+                controller.abort();
+                throw err('TRANSIENT');
+            });
+        const thrown = await runWithModelFailover(
+            [slot('A'), slot('B'), slot('C')],
+            runOne,
+            { ...opts, signal: controller.signal },
+        ).catch((e) => e);
+        expect(runOne).toHaveBeenCalledTimes(2);
+        expect(readAttemptedSlot(thrown)).toMatchObject({ model: 'B' });
+    });
+
+    it('records the hops before the entry that answered', async () => {
+        const { failovers } = await recordModelFailovers(() =>
+            runWithModelFailover(
+                [slot('A'), slot('B'), slot('C')],
+                jest
+                    .fn()
+                    .mockRejectedValueOnce(err('AUTH_INVALID'))
+                    .mockRejectedValueOnce(
+                        err('TRANSIENT', { __providerTimeout: true }),
+                    )
+                    .mockResolvedValueOnce('ok'),
+                opts,
+            ),
+        );
+        expect(failovers).toHaveLength(1);
+        expect(failovers[0]).toMatchObject({
+            failedModel: 'A',
+            usedModel: 'C',
+            chainIndex: 2,
+        });
+        expect(
+            failovers[0].hops.map((h) => [h.model, h.chainIndex, h.reason]),
+        ).toEqual([
+            ['A', 0, 'AUTH_INVALID'],
+            ['B', 1, 'provider-timeout'],
+        ]);
+    });
+
+    it('names a round-trip deadline as its own hop reason', async () => {
+        const deadline = new ProviderDeadlineError({
+            deadlineMs: 1000,
+            source: 'round-trip',
+            phase: 'round-trip',
+        });
+        Object.assign(deadline, {
+            __cat: 'TRANSIENT',
+            __providerTimeout: true,
+        });
+        const { failovers } = await recordModelFailovers(() =>
+            runWithModelFailover(
+                [slot('A'), slot('B')],
+                jest
+                    .fn()
+                    .mockRejectedValueOnce(deadline)
+                    .mockResolvedValueOnce('ok'),
+                opts,
+            ),
+        );
+        expect(failovers[0].hops[0].reason).toBe('deadline');
+    });
+
+    it('stamps every hop on the error after a terminal failure, and lists them in the warn', async () => {
+        mockLog.warn.mockClear();
+        const thrown = await runWithModelFailover(
+            [slot('A'), slot('B'), slot('C')],
+            jest
+                .fn()
+                .mockRejectedValueOnce(err('AUTH_INVALID'))
+                .mockRejectedValueOnce(err('TRANSIENT'))
+                .mockRejectedValueOnce(err('QUOTA_EXCEEDED')),
+            opts,
+        ).catch((e) => e);
+        expect(readFailoverHops(thrown)?.map((h) => h.model)).toEqual([
+            'A',
+            'B',
+            'C',
+        ]);
+        expect(Object.keys(thrown)).not.toContain('hops');
+        const terminal = mockLog.warn.mock.calls.at(-1)[0];
+        expect(terminal.message).toContain(
+            '[after: "A" failed (AUTH_INVALID), "B" failed (TRANSIENT)]',
+        );
+        expect(terminal.metadata.chainIndex).toBe(2);
+        expect(terminal.metadata.hops).toHaveLength(3);
+    });
+
+    it('carries chainIndex and reason on each cascade warn', async () => {
+        mockLog.warn.mockClear();
+        await runWithModelFailover(
+            [slot('A'), slot('B'), slot('C')],
+            jest
+                .fn()
+                .mockRejectedValueOnce(err('AUTH_INVALID'))
+                .mockRejectedValueOnce(err('TRANSIENT'))
+                .mockResolvedValueOnce('ok'),
+            opts,
+        );
+        expect(
+            mockLog.warn.mock.calls.map(([c]) => [
+                c.metadata.chainIndex,
+                c.metadata.reason,
+                c.metadata.toModelId,
+            ]),
+        ).toEqual([
+            [0, 'AUTH_INVALID', 'B'],
+            [1, 'TRANSIENT', 'C'],
+        ]);
+    });
+});
+
 describe('recordModelFailovers (#2066)', () => {
     const opts = { runName: 'code-review-bug' };
 
@@ -348,7 +564,21 @@ describe('recordModelFailovers (#2066)', () => {
 
         expect(value).toBe('from-fallback');
         expect(failovers).toEqual([
-            { runName: 'code-review-bug', failedModel: 'A', usedModel: 'B' },
+            {
+                runName: 'code-review-bug',
+                failedModel: 'A',
+                usedModel: 'B',
+                chainIndex: 1,
+                hops: [
+                    {
+                        model: 'A',
+                        chainIndex: 0,
+                        outcome: 'failed',
+                        reason: 'AUTH_INVALID',
+                        elapsedMs: expect.any(Number),
+                    },
+                ],
+            },
         ]);
     });
 

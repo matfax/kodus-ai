@@ -19,9 +19,11 @@
 import {
     isByokConfig,
     type BYOKConfig,
+    type FallbackSlot,
     type LlmTask,
     type NormalizedModel,
 } from './byok-config';
+import { fallbackChainOf } from './byok-fallback-chain';
 import type { RequestContext, RoutingVerdict } from './routing-strategy';
 import { StaticTaskStrategy } from './static-task-strategy';
 import { resolveModelSlot } from './resolve-model-slot';
@@ -76,45 +78,88 @@ export function resolveTaskSlot(
           })
         : routed;
 
-    // Runtime failover target: stamp the org's configured fallback (gate-checked)
-    // onto the primary slot so it rides to `LLM.run` with no per-consumer
-    // threading. Skip when the primary that WON is already the fallback
-    // (`usedFallback` — nothing better to try), when no eligible fallback exists,
-    // or when it resolves to the same model as the primary. The fallback is a
-    // PLAIN slot (no nested `.fallback`) — the cascade is one hop, primary→fallback.
-    const slotWithFallback =
-        slot && !verdict.usedFallback
-            ? attachFallback(config, task, slot, verdict.modelId)
-            : slot;
+    // Runtime failover chain: stamp the org's configured fallbacks
+    // (gate-checked) onto the primary slot so they ride to `LLM.run` with no
+    // per-consumer threading. When the primary that WON is itself a chain
+    // entry (`usedFallback`), only the entries after it remain to try. Each
+    // entry is a PLAIN slot (no nested `.fallbacks`).
+    const slotWithFallbacks = slot
+        ? attachFallbacks(config, task, slot, verdict)
+        : slot;
 
-    return { slot: slotWithFallback, verdict };
+    return { slot: slotWithFallbacks, verdict };
 }
 
-/** Resolve + gate the org's fallback model and attach it to `primarySlot.fallback`,
- *  or return `primarySlot` unchanged when there's no distinct, eligible fallback. */
-function attachFallback(
+/**
+ * Resolve + gate the org's fallback chain and attach the distinct, eligible
+ * entries to `primarySlot.fallbacks`, or return `primarySlot` unchanged when
+ * none qualifies. Entries are deduped against the primary and each other, by
+ * `models[]` id and by what is actually served (provider + model + baseURL +
+ * credential), so two configured ids that call the same thing are tried once.
+ */
+function attachFallbacks(
     config: BYOKConfig,
     task: LlmTask,
     primarySlot: NormalizedModel,
-    primaryModelId: string,
+    verdict: RoutingVerdict,
 ): NormalizedModel {
     // Fast path (the common case): no fallback configured → skip the extra gate
     // pass entirely. Routing runs on every LLM call, so don't rebuild the lookup
-    // maps for a fallback that isn't there.
-    if (!config.routing?.fallbackModelId) {
+    // maps for a chain that isn't there.
+    const chain = fallbackChainOf(config.routing);
+    if (chain.length === 0) {
         return primarySlot;
     }
-    const fbVerdict = strategy.resolveFallback(task, config);
-    if (!fbVerdict?.modelId || fbVerdict.modelId === primaryModelId) {
-        return primarySlot;
+    // A gate-time winner from the chain: only the entries after it are a tail.
+    // One that cannot be placed in the chain gets no tail, as before the chain.
+    let afterModelId: string | undefined;
+    if (verdict.usedFallback) {
+        if (!verdict.modelId || !chain.includes(verdict.modelId)) {
+            return primarySlot;
+        }
+        afterModelId = verdict.modelId;
     }
-    const fbRouted = resolveModelSlot(config, fbVerdict.modelId);
-    if (!fbRouted) {
-        return primarySlot;
+
+    const { fallbacks: verdicts } = strategy.resolveFallbacks(
+        task,
+        config,
+        afterModelId,
+    );
+    const seenIds = new Set<string>([verdict.modelId ?? '']);
+    const seenServed = new Set<string>([servedKey(primarySlot)]);
+    const fallbacks: FallbackSlot[] = [];
+    for (const entry of verdicts) {
+        if (seenIds.has(entry.modelId)) {
+            continue;
+        }
+        seenIds.add(entry.modelId);
+        const routed = resolveModelSlot(config, entry.modelId);
+        if (!routed) {
+            continue;
+        }
+        const served = asServedSlot({
+            ...routed,
+            route: task,
+            usedFallback: true,
+            chainIndex: entry.chainIndex,
+        });
+        const key = servedKey(served);
+        if (seenServed.has(key)) {
+            continue;
+        }
+        seenServed.add(key);
+        fallbacks.push(served);
     }
-    return {
-        ...primarySlot,
-        fallback: asServedSlot({ ...fbRouted, route: task, usedFallback: true }),
-    };
+    return fallbacks.length > 0 ? { ...primarySlot, fallbacks } : primarySlot;
 }
 
+/** What a slot actually calls: the same provider + model + endpoint +
+ *  credential is the same route, whatever `models[]` id names it. */
+function servedKey(slot: NormalizedModel): string {
+    return [
+        slot.provider,
+        slot.model,
+        slot.baseURL ?? '',
+        slot.credentialId ?? '',
+    ].join('::');
+}

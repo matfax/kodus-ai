@@ -179,11 +179,12 @@ export class LLM {
         req: LlmRequest & { schema?: z.ZodType | Schema },
     ): Promise<unknown> {
         // Resolve the routing decision ONCE. The primary slot carries its runtime
-        // fallback in `.fallback` (stamped by resolveTaskSlot), so the cascade is
-        // primary → fallback; a slot without a fallback (or the managed default,
-        // undefined) makes `runWithModelFailover` a single-attempt pass-through.
+        // fallback chain in `.fallbacks` (stamped by resolveTaskSlot), so the
+        // cascade is primary → fallbacks in order; a slot without fallbacks (or
+        // the managed default, undefined) makes `runWithModelFailover` a
+        // single-attempt pass-through.
         const slot = resolveSlot(req);
-        const attempts = [slot, slot?.fallback];
+        const attempts = [slot, ...(slot?.fallbacks ?? [])];
         const failoverOpts = {
             runName: req.runName,
             organizationId: req.organizationId,
@@ -215,7 +216,10 @@ export class LLM {
                         maxOutputTokens: req.maxOutputTokens,
                         temperature: req.temperature,
                     }),
-                failoverOpts,
+                // The loop's signal is the caller's budget: once it has aborted,
+                // no further chain entry is started on it. One-shot calls carry
+                // no caller signal (toExecutorParams drops it), so none is passed.
+                { ...failoverOpts, signal: req.signal },
             );
         }
 

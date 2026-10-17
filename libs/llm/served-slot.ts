@@ -19,11 +19,11 @@ import { BYOKProvider } from './model-providers';
 import { servedByOpenAi } from './providers/openai/endpoint';
 
 export function asServedSlot<T extends NormalizedModel>(slot: T): T {
-    const fallback = slot.fallback
-        ? asServedSlot(slot.fallback)
-        : slot.fallback;
+    const fallbacks = slot.fallbacks?.map((entry) => asServedSlot(entry));
     const withFallback =
-        fallback === slot.fallback ? slot : { ...slot, fallback };
+        !fallbacks || fallbacks.every((entry, i) => entry === slot.fallbacks[i])
+            ? slot
+            : { ...slot, fallbacks };
     if (
         withFallback.provider !== BYOKProvider.OPENAI_COMPATIBLE ||
         !servedByOpenAi(withFallback.model, withFallback.baseURL)
