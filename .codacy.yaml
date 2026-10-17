@@ -35,6 +35,22 @@ engines:
       - "tests/**"
       - "evals/**"
       - "scripts/**"
+  # Same dev-tooling paths as eslint-8; Trivy and Checkov still scan them for
+  # secrets. package.json ranges are pinned by the committed pnpm lockfiles
+  # (every CI install uses --frozen-lockfile).
+  opengrep:
+    exclude_paths:
+      - "**/*.spec.ts"
+      - "**/*.spec.tsx"
+      - "**/*.test.ts"
+      - "**/*.test.tsx"
+      - "**/*.e2e-spec.ts"
+      - "**/__tests__/**"
+      - "test/**"
+      - "tests/**"
+      - "evals/**"
+      - "scripts/**"
+      - "**/package.json"
   # Synthetic credential corpus for the secret-scanner benchmark.
   trivy:
     exclude_paths:
