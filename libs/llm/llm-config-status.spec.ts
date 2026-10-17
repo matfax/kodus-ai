@@ -222,6 +222,7 @@ describe('describeLLMConfigStatus — effective config projection', () => {
             expect(describeLLMConfigStatus(blob)).toEqual({
                 source: 'none',
                 models: [],
+                fallbackChain: [],
                 byok: { configured: false },
                 env: { configured: false },
             });
@@ -258,6 +259,7 @@ describe('describeLLMConfigStatus — effective config projection', () => {
                     },
                 },
             ],
+            fallbackChain: [],
             byok: {
                 configured: true,
                 model: 'gpt-4o',
@@ -266,6 +268,41 @@ describe('describeLLMConfigStatus — effective config projection', () => {
             },
             env: { configured: false },
         });
+    });
+
+    it('lists the normalized fallback chain, head first, so the tail is visible', () => {
+        const config: BYOKConfig = {
+            version: 2,
+            credentials: [{ id: 'cred-1', provider: 'openai', apiKey: 'enc' }],
+            models: ['m1', 'm2', 'm3', 'm4'].map((id) => ({
+                id,
+                credentialId: 'cred-1',
+                model: 'gpt-4o',
+            })),
+            routing: {
+                defaultModelId: 'm1',
+                fallbackModelId: 'm3',
+                fallbackModelIds: ['m2', 'm3', 'm4'],
+            },
+        };
+        expect(describeLLMConfigStatus(config).fallbackChain).toEqual([
+            'm3',
+            'm2',
+            'm4',
+        ]);
+    });
+
+    it('a legacy single fallback lists one chain entry', () => {
+        const config: BYOKConfig = {
+            version: 2,
+            credentials: [{ id: 'cred-1', provider: 'openai', apiKey: 'enc' }],
+            models: [
+                { id: 'm1', credentialId: 'cred-1', model: 'gpt-4o' },
+                { id: 'm2', credentialId: 'cred-1', model: 'gpt-4o-mini' },
+            ],
+            routing: { defaultModelId: 'm1', fallbackModelId: 'm2' },
+        };
+        expect(describeLLMConfigStatus(config).fallbackChain).toEqual(['m2']);
     });
 
     it('no BYOK slot + env configured → source "env", env fields surfaced, models []', () => {

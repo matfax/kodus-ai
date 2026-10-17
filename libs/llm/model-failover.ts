@@ -1,28 +1,52 @@
 /**
- * Runtime model FAILOVER — cascade `primary → fallback` when a call fails.
+ * Runtime model FAILOVER — cascade `primary → fallbacks[0] → …` when a call fails.
  *
  * The routing layer (`resolveTaskSlot`) already decides WHICH model runs a task
- * and stamps the org's configured fallback onto `slot.fallback`. This owns the
- * OTHER half: when the model that ran actually FAILS at call time in a way a
- * different model can fix, re-run the call once on the fallback. It is the
- * OUTERMOST retry — it wraps the executor, which already owns the same-model
+ * and stamps the org's configured fallback chain onto `slot.fallbacks`. This
+ * owns the OTHER half: when the model that ran actually FAILS at call time in a
+ * way a different model can fix, re-run the call on the next chain entry. It is
+ * the OUTERMOST retry — it wraps the executor, which already owns the same-model
  * recovery (SDK per-step retry, the one-shot D-00c re-issue, the limiter's
  * cooldown). So a model is only abandoned after it has exhausted its OWN retries.
  *
- * This is NOT a runtime failover cascade of N models: at most one hop
- * (primary → fallback), matching the single `routing.fallbackModelId` the user
- * configures. `fallback` is a deliberate backup (often a cheaper/steadier model),
- * not "the next tier" — the selection precedence (per-agent → default) is a
- * SEPARATE concern owned by the router, not re-walked here.
+ * The chain is the ordered list the org configured (`routing.fallbackModelIds`,
+ * at most MAX_FALLBACKS entries after the primary). Each entry is a deliberate
+ * backup (often a cheaper/steadier model), not "the next tier" — the selection
+ * precedence (per-agent → default) is a SEPARATE concern owned by the router,
+ * not re-walked here. The cascade stops at the first success, at an error that
+ * must not cascade, once an attempt marked itself unsafe to restart, or when
+ * the caller's signal has aborted. Between calls, the circuit breaker
+ * (`provider-circuit.ts`) lets the cascade skip an entry whose model keeps
+ * failing, so the next call does not pay to learn the outage again.
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
 
 import { createLogger } from '@libs/core/log/logger';
 import { LLM_ERROR_TAG, LLM_SUCCESS_TAG } from '@libs/llm/log-tags';
 import type { NormalizedModel } from '@libs/llm/byok-config';
+import { getLimiterForSlot } from '@libs/llm/byok-limiter';
+import { LLM_CALL_TIMEOUT_MS } from '@libs/llm/llm-call';
+import {
+    circuitCountsFailure,
+    circuitKeyFor,
+    circuitLabelsFor,
+    LLM_CIRCUIT_TAG,
+    providerCircuit,
+    retryAfterMsOf,
+    type CircuitAdmission,
+    type CircuitState,
+} from '@libs/llm/provider-circuit';
+import {
+    failoverRoundTripDeadlineMs,
+    isProviderDeadlineError,
+    MAX_ROUND_TRIP_DEADLINE_MS,
+} from '@libs/llm/provider-deadline-error';
+import { REGISTRY } from '@libs/llm/providers';
 import {
     classifyLLMError,
     isAbortOrHardTimeout,
+    isCallerAbortOrBudget,
+    isProviderTimeout,
     isTerminalCategory,
     LlmErrorCategory,
     retriesWereExhausted,
@@ -30,11 +54,32 @@ import {
 
 const logger = createLogger('ModelFailover');
 
-/** A call that failed on one model and was answered by the next. */
+/** Why a chain entry did not answer: the classified category, or the
+ *  timeout / breaker reason that decided the hop. */
+export type FailoverHopReason =
+    LlmErrorCategory | 'provider-timeout' | 'deadline' | 'circuit-open';
+
+/** One chain entry that was tried (or skipped) without answering. */
+export interface FailoverHop {
+    model: string;
+    /** Position in the runtime chain: 0 = the primary. */
+    chainIndex: number;
+    outcome: 'failed' | 'skipped';
+    reason: FailoverHopReason;
+    elapsedMs: number;
+}
+
+/** A call that failed on one model and was answered by a later one. */
 export interface ModelFailoverEvent {
     runName: string;
+    /** The primary — the model the call was routed to. */
     failedModel: string;
+    /** The chain entry that answered. */
     usedModel: string;
+    /** Position of `usedModel` in the runtime chain (1 = first fallback). */
+    chainIndex: number;
+    /** Every entry before it, in order, and why each did not answer. */
+    hops: FailoverHop[];
 }
 
 const failoverRecorder = new AsyncLocalStorage<ModelFailoverEvent[]>();
@@ -68,12 +113,27 @@ export async function recordModelFailovers<T>(
  *    for a real rate limit, so outliving it disproves the label (see
  *    `retriesWereExhausted`).
  *  - CONTEXT_OVERFLOW — the prompt is too big; a same-class fallback won't fit it.
- *  - Abort / hard-timeout — the failure is latency or a cancel, not the model;
- *    re-running burns the whole timeout budget again.
+ *  - A caller abort or a Kodus budget (hard-timeout race, limiter queue
+ *    timeout) — the failure is a cancel or a spent budget, not the model; the
+ *    next model would inherit the same spent budget.
  *  - UNKNOWN — unclassified; stay conservative rather than spend a 2nd billed call.
+ *
+ * A PROVIDER timeout (504/408/524, an undici timeout, our round-trip deadline)
+ * is the opposite case and does cascade: the route is down, not the budget.
+ * `LLM_PROVIDER_TIMEOUT_CASCADE=off` restores the old prose gate, which could
+ * not tell the two apart.
  */
 export function shouldFailoverToNextModel(err: unknown): boolean {
-    if (isAbortOrHardTimeout(err)) {
+    if (providerTimeoutCascadeEnabled()) {
+        // The caller check runs first: a cancel wrapped around a provider
+        // timeout is still a cancel.
+        if (isCallerAbortOrBudget(err)) {
+            return false;
+        }
+        if (isProviderTimeout(err)) {
+            return true;
+        }
+    } else if (isAbortOrHardTimeout(err)) {
         return false;
     }
     const { category } = classifyLLMError(err);
@@ -113,8 +173,50 @@ export function shouldFailoverToNextModel(err: unknown): boolean {
     }
 }
 
+/**
+ * Kill switch for the provider-timeout cascade. On by default (it is a bug
+ * fix); `LLM_PROVIDER_TIMEOUT_CASCADE=off` puts back the prose gate
+ * (`isAbortOrHardTimeout`) both here and in the one-shot D-00c re-issue. Read
+ * per call, so no module state caches a stale value.
+ */
+export function providerTimeoutCascadeEnabled(
+    env: Readonly<Record<string, string | undefined>> = process.env,
+): boolean {
+    const raw = env.LLM_PROVIDER_TIMEOUT_CASCADE?.trim().toLowerCase();
+    return !(raw === 'off' || raw === 'false' || raw === '0');
+}
+
+/**
+ * The round-trip deadline for one chain entry: the env knob, raised to the
+ * provider's declared minimum (a cold-start provider declares one) and kept
+ * under the clamp. Undefined when the knob is off.
+ */
+export function roundTripDeadlineFor(
+    slot: NormalizedModel | undefined,
+): number | undefined {
+    const knob = failoverRoundTripDeadlineMs();
+    if (knob === undefined) return undefined;
+    const floor =
+        slot && REGISTRY.has(slot.provider)
+            ? REGISTRY.get(slot.provider).minRoundTripDeadlineMs
+            : undefined;
+    return Math.min(Math.max(knob, floor ?? 0), MAX_ROUND_TRIP_DEADLINE_MS);
+}
+
+/** A probe lease outlives the probe's own deadline by this margin. */
+const PROBE_LEASE_MARGIN_MS = 10_000;
+
 /** Handed to each attempt so it can veto its own retry. */
 export interface FailoverAttemptControl {
+    /** True once this attempt called `markUnsafeToRetry`. */
+    isUnsafe(): boolean;
+    /**
+     * True when a later chain entry will run if this attempt fails in a
+     * cascade-worthy way. The one-shot D-00c re-issue reads it: a provider
+     * timeout is thrown to the next entry instead of being re-issued on the
+     * same stalled route.
+     */
+    readonly hasNext: boolean;
     /**
      * Mark THIS attempt as no longer safely restartable — it has emitted output a
      * fresh run would DUPLICATE (an agent-loop step already ran + mutated shared
@@ -123,11 +225,25 @@ export interface FailoverAttemptControl {
      * committed until they return) and never call this, so they always fail over.
      */
     markUnsafeToRetry(): void;
+    /**
+     * The provider answered a request of this attempt. Wired to the BYOK
+     * wrapper's answer hook: a half-open circuit probe resolves here, on the
+     * first answer, not when a long loop finally ends. Idempotent, and a
+     * no-op once the attempt has failed: a late answer is not a recovery.
+     */
+    onAnswered(): void;
+    /** Position of this attempt in the runtime chain: 0 = the primary. */
+    readonly chainIndex: number;
+    /** The breaker state this attempt was admitted under; undefined when no
+     *  breaker applies (no org, the managed default, mode off). */
+    readonly circuitState?: CircuitState;
+    /** Why the previous chain entry did not answer; undefined on the primary. */
+    readonly failoverReason?: FailoverHopReason;
 }
 
-/** Distinct, order-preserving attempts. Drops a fallback that resolves to the same
- *  model as the primary; the managed-default attempt (`undefined`) is only ever the
- *  sole entry — never queued as a fallback after a real slot. */
+/** Distinct, order-preserving attempts. Drops a chain entry that resolves to the
+ *  same model as an earlier one; the managed-default attempt (`undefined`) is only
+ *  ever the sole entry — never queued as a fallback after a real slot. */
 function distinctAttempts(
     slots: Array<NormalizedModel | undefined>,
 ): Array<NormalizedModel | undefined> {
@@ -150,19 +266,13 @@ function distinctAttempts(
     return out.length > 0 ? out : [undefined];
 }
 
-/**
- * Run `runOne` on the primary slot; on a cascade-worthy failure it could not
- * recover from, re-run once on the fallback (the tail of `slots`). Returns the
- * first success; re-throws the LAST error when every attempt is exhausted or the
- * failure is not cascade-worthy. With a single slot (no fallback) this is a thin
- * pass-through — `runOne` is invoked exactly once.
- */
 const ATTEMPTED_SLOT = Symbol('attemptedSlot');
+const FAILOVER_HOPS = Symbol('failoverHops');
 
 /**
  * Which model actually ran on the attempt that failed.
  *
- * The cascade is primary → fallback, so a terminal failure belongs to whichever
+ * The cascade walks the chain, so a terminal failure belongs to whichever
  * attempt was LAST — not to the slot resolved before the run. A caller that
  * reports the resolved slot after a fallback also failed names a model/provider
  * pair that never co-occurred, and does it in exactly the case the report exists
@@ -211,31 +321,191 @@ export function readAttemptedSlot(
         { model?: string; provider?: string } | undefined;
 }
 
+/** The hops a call made before it failed for good, when it came through the
+ *  failover (the last one is the failure that was thrown). Non-enumerable on
+ *  the error, like the attempted slot. */
+export function readFailoverHops(err: unknown): FailoverHop[] | undefined {
+    if (!err || typeof err !== 'object') return undefined;
+    return (err as Record<symbol, unknown>)[FAILOVER_HOPS] as
+        FailoverHop[] | undefined;
+}
+
+function attachFailoverHops<T extends object>(err: T, hops: FailoverHop[]): T {
+    try {
+        Object.defineProperty(err, FAILOVER_HOPS, {
+            value: hops,
+            enumerable: false,
+            writable: false,
+            configurable: true,
+        });
+    } catch {
+        // Frozen or exotic error object: the terminal warn already lists the
+        // hops, which is the record that matters.
+    }
+    return err;
+}
+
+/** The reason a hop is recorded under: our deadline and a provider timeout
+ *  are named as such (they classify TRANSIENT), anything else by category. */
+function hopReason(
+    err: unknown,
+    category: LlmErrorCategory,
+): FailoverHopReason {
+    if (isProviderDeadlineError(err)) {
+        return 'deadline';
+    }
+    if (providerTimeoutCascadeEnabled() && isProviderTimeout(err)) {
+        return 'provider-timeout';
+    }
+    return category;
+}
+
+/** Ask the circuit breaker about one chain entry. Undefined when no breaker
+ *  applies: mode off, the managed default, a BYOK slot without an org. */
+function admitAttempt(
+    slot: NormalizedModel | undefined,
+    isLast: boolean,
+    opts: { organizationId?: string },
+): CircuitAdmission | undefined {
+    const key = circuitKeyFor(slot, opts.organizationId);
+    if (!key || providerCircuit.currentMode() === 'off') return undefined;
+    return providerCircuit.admit(key, {
+        isLast,
+        labels: circuitLabelsFor(slot, opts.organizationId),
+        probeLeaseMs:
+            (roundTripDeadlineFor(slot) ?? LLM_CALL_TIMEOUT_MS) +
+            PROBE_LEASE_MARGIN_MS,
+        isCoolingDown: () =>
+            !!getLimiterForSlot({
+                slot,
+                organizationId: opts.organizationId,
+            })?.isInCooldown(),
+    });
+}
+
+/**
+ * Tell the breaker how an attempt failed. Only a failure that says the
+ * provider is unwell AND moved the call on counts (`circuitCountsFailure`);
+ * anything else just hands a probe lease back. A failure after
+ * `markUnsafeToRetry` still counts — the generation on the ticket decides
+ * whether it is still news.
+ */
+function reportAttemptFailure(
+    ticket: CircuitAdmission['ticket'],
+    err: unknown,
+): void {
+    if (!ticket) return;
+    if (circuitCountsFailure(err) && shouldFailoverToNextModel(err)) {
+        providerCircuit.onFailure(ticket, {
+            retryAfterMs: retryAfterMsOf(err),
+        });
+    } else {
+        providerCircuit.release(ticket);
+    }
+}
+
+/**
+ * Run `runOne` on the primary slot; on a cascade-worthy failure it could not
+ * recover from, re-run on the next chain entry (the tail of `slots`), in order.
+ * Returns the first success; re-throws the LAST error when every attempt is
+ * exhausted, the failure is not cascade-worthy, the attempt was marked unsafe,
+ * or `opts.signal` has aborted (the caller's budget is gone, so the next entry
+ * is not started). With a single slot this is a thin pass-through — `runOne` is
+ * invoked exactly once.
+ *
+ * Before each attempt the circuit breaker is asked (`admitAttempt`): an entry
+ * whose model keeps failing is skipped — recorded as a `circuit-open` hop —
+ * unless it is the last, which always runs. The attempt reports its first
+ * provider answer and its counted failures back to the breaker.
+ */
 export async function runWithModelFailover<T>(
     slots: Array<NormalizedModel | undefined>,
     runOne: (
         slot: NormalizedModel | undefined,
         control: FailoverAttemptControl,
     ) => Promise<T>,
-    opts: { runName: string; organizationId?: string },
+    opts: { runName: string; organizationId?: string; signal?: AbortSignal },
 ): Promise<T> {
     const attempts = distinctAttempts(slots);
+    const hops: FailoverHop[] = [];
+    const nameOf = (i: number) => attempts[i]?.model ?? 'managed-default';
 
     for (let i = 0; i < attempts.length; i++) {
+        const attemptSlot = attempts[i];
+        const isLastEntry = i >= attempts.length - 1;
+        const admission = admitAttempt(attemptSlot, isLastEntry, opts);
+        if (admission?.decision === 'skip') {
+            hops.push({
+                model: nameOf(i),
+                chainIndex: i,
+                outcome: 'skipped',
+                reason: 'circuit-open',
+                elapsedMs: 0,
+            });
+            logger.log({
+                message: `${LLM_CIRCUIT_TAG} ${opts.runName}: "${nameOf(i)}" skipped (circuit ${admission.state}); trying "${nameOf(i + 1)}"`,
+                context: 'runWithModelFailover',
+                metadata: {
+                    runName: opts.runName,
+                    organizationId: opts.organizationId,
+                    chainIndex: i,
+                    circuitState: admission.state,
+                    fromModelId: attemptSlot?.byokModelId,
+                    toModelId: attempts[i + 1]?.byokModelId,
+                },
+            });
+            continue;
+        }
+        if (admission?.wouldSkip) {
+            logger.log({
+                message: `${LLM_CIRCUIT_TAG} ${opts.runName}: "${nameOf(i)}" would-skip (circuit ${admission.state}, shadow mode)`,
+                context: 'runWithModelFailover',
+                metadata: {
+                    runName: opts.runName,
+                    organizationId: opts.organizationId,
+                    chainIndex: i,
+                    circuitState: admission.state,
+                    modelId: attemptSlot?.byokModelId,
+                },
+            });
+        }
+        const ticket = admission?.ticket ?? null;
+
         let unsafeToRetry = false;
+        // Set on the first answer AND when the attempt fails: an answer that
+        // arrives after the failure was counted (a provider that ignored the
+        // deadline's abort and answered inside the slot-hold cap) is not news,
+        // and must not wipe the failure count it just raised.
+        let settled = false;
+        const onAnswered = () => {
+            if (settled) return;
+            settled = true;
+            providerCircuit.onSuccess(ticket);
+        };
         const control: FailoverAttemptControl = {
+            hasNext: !isLastEntry,
+            isUnsafe: () => unsafeToRetry,
             markUnsafeToRetry: () => {
                 unsafeToRetry = true;
             },
+            onAnswered,
+            chainIndex: i,
+            circuitState: admission?.state,
+            failoverReason: hops.at(-1)?.reason,
         };
+        const startedAt = Date.now();
 
         try {
-            const result = await runOne(attempts[i], control);
+            const result = await runOne(attemptSlot, control);
+            // A result is an answer, whether or not the executor reported it.
+            onAnswered();
             if (i > 0) {
                 failoverRecorder.getStore()?.push({
                     runName: opts.runName,
-                    failedModel: attempts[0]?.model ?? 'managed-default',
-                    usedModel: attempts[i]?.model ?? 'managed-default',
+                    failedModel: nameOf(0),
+                    usedModel: nameOf(i),
+                    chainIndex: i,
+                    hops: [...hops],
                 });
             }
             // DEBUG level: completes the [LLM-ERROR]/[LLM-SUCCESS] pair at the one
@@ -244,19 +514,37 @@ export async function runWithModelFailover<T>(
             // unless debug logging is enabled (then a full call trace is greppable
             // by tag). `usedFallback` flags a call that only survived via failover.
             logger.debug({
-                message: `${LLM_SUCCESS_TAG} ${opts.runName}: "${attempts[i]?.model ?? 'managed-default'}" ok${i > 0 ? ' (via fallback)' : ''}`,
+                message: `${LLM_SUCCESS_TAG} ${opts.runName}: "${nameOf(i)}" ok${i > 0 ? ' (via fallback)' : ''}`,
                 context: 'runWithModelFailover',
                 metadata: {
                     runName: opts.runName,
                     organizationId: opts.organizationId,
                     modelId: attempts[i]?.byokModelId,
                     usedFallback: i > 0,
+                    chainIndex: i,
                 },
             });
             return result;
         } catch (err) {
-            const isLast = i >= attempts.length - 1;
-            if (isLast || unsafeToRetry || !shouldFailoverToNextModel(err)) {
+            const { category } = classifyLLMError(err);
+            const reason = hopReason(err, category);
+            hops.push({
+                model: nameOf(i),
+                chainIndex: i,
+                outcome: 'failed',
+                reason,
+                elapsedMs: Date.now() - startedAt,
+            });
+            settled = true;
+            reportAttemptFailure(ticket, err);
+
+            const callerAborted = !!opts.signal?.aborted;
+            if (
+                isLastEntry ||
+                unsafeToRetry ||
+                callerAborted ||
+                !shouldFailoverToNextModel(err)
+            ) {
                 // Terminal failure: no more attempts (or this error must not
                 // cascade). Emit ONE greppable [LLM-ERROR] line here — the single
                 // chokepoint every LLM.run call funnels through — so a failed LLM
@@ -264,39 +552,48 @@ export async function runWithModelFailover<T>(
                 // instead of dying as an unlogged re-throw. WARN level: a terminal
                 // LLM failure is a user config/billing/provider problem, not an
                 // app outage (mirrors the failover swap below).
-                const { category } = classifyLLMError(err);
+                const earlier = hops
+                    .slice(0, -1)
+                    .map((h) => `"${h.model}" ${h.outcome} (${h.reason})`);
                 logger.warn({
-                    message: `${LLM_ERROR_TAG} ${opts.runName}: "${attempts[i]?.model ?? 'managed-default'}" failed (${category}) — ${(err as Error)?.message ?? 'unknown error'}`,
+                    message: `${LLM_ERROR_TAG} ${opts.runName}: "${nameOf(i)}" failed (${category}) — ${(err as Error)?.message ?? 'unknown error'}${earlier.length ? ` [after: ${earlier.join(', ')}]` : ''}`,
                     context: 'runWithModelFailover',
                     metadata: {
                         runName: opts.runName,
                         organizationId: opts.organizationId,
                         category,
+                        reason,
                         modelId: attempts[i]?.byokModelId,
-                        exhausted: isLast,
+                        chainIndex: i,
+                        exhausted: isLastEntry,
+                        callerAborted,
+                        hops,
                     },
                 });
-                // Record WHICH attempt this was before it leaves: downstream
-                // reporting otherwise re-reads the pre-run resolved slot and
-                // names the primary for a failure that belongs to the fallback.
+                // Record WHICH attempt this was, and the hops before it, before
+                // it leaves: downstream reporting otherwise re-reads the pre-run
+                // resolved slot and names the primary for a failure that
+                // belongs to a fallback.
                 throw typeof err === 'object' && err !== null
-                    ? attachAttemptedSlot(err, attempts[i])
+                    ? attachFailoverHops(
+                          attachAttemptedSlot(err, attempts[i]),
+                          hops,
+                      )
                     : err;
             }
 
-            const { category } = classifyLLMError(err);
-            const from = attempts[i]?.model ?? 'managed-default';
-            const to = attempts[i + 1]?.model ?? 'managed-default';
             // WARN not ERROR: a terminal failure is a user config/billing problem
             // (mirrors llmErrorLogLevel), and the run still succeeds via the
             // fallback — the interesting signal is the SWAP, not an outage.
             logger.warn({
-                message: `${LLM_ERROR_TAG} [model-failover] ${opts.runName}: "${from}" failed (${category}); cascading to fallback "${to}"`,
+                message: `${LLM_ERROR_TAG} [model-failover] ${opts.runName}: "${nameOf(i)}" failed (${reason}); cascading to fallback "${nameOf(i + 1)}"`,
                 context: 'runWithModelFailover',
                 metadata: {
                     runName: opts.runName,
                     organizationId: opts.organizationId,
                     category,
+                    reason,
+                    chainIndex: i,
                     fromModelId: attempts[i]?.byokModelId,
                     toModelId: attempts[i + 1]?.byokModelId,
                 },
@@ -305,7 +602,7 @@ export async function runWithModelFailover<T>(
     }
 
     // Unreachable: `distinctAttempts` guarantees ≥1 attempt, and the LAST one always
-    // throws in the catch above (`isLast`). This satisfies the compiler's need for a
+    // throws in the catch above (`isLastEntry`). This satisfies the compiler's need for a
     // terminal path without carrying a dead "last error" across iterations.
     throw new Error(
         `runWithModelFailover(${opts.runName}): exhausted attempts without returning`,

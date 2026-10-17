@@ -215,6 +215,11 @@ export interface ProviderModule {
     doc?: string;
     /** Zod schema validating this provider's `settings` (baseURL, region, ...). */
     settingsSchema: z.ZodType;
+    /** The shortest failover round-trip deadline this provider tolerates — for
+     *  one whose first answer is legitimately slow (a cold-starting agent
+     *  runtime). The deadline uses the larger of this and the env knob, still
+     *  under the clamp. Absent ⇒ the knob alone. */
+    minRoundTripDeadlineMs?: number;
     /** Static capability descriptor for a given model id. Extended in 01-04. */
     capabilities(model: string): ModelCapabilities;
     /** Build the AI SDK LanguageModel. `cfg.apiKey` is already DECRYPTED. */

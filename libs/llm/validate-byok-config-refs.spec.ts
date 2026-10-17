@@ -3,6 +3,7 @@ import {
     findModelReferences,
 } from './validate-byok-config-refs';
 import type { BYOKConfig } from './byok-config';
+import { MAX_FALLBACKS } from './byok-fallback-chain';
 
 const v2 = (over: Partial<BYOKConfig> = {}): BYOKConfig => ({
     version: 2,
@@ -91,6 +92,61 @@ describe('validateByokConfigRefs', () => {
             expect(result.errors[0]).toContain('nope');
         });
 
+        it('fails when a fallbackModelIds entry points at a missing model', () => {
+            const config = v2({
+                routing: {
+                    fallbackModelId: 'model-a',
+                    fallbackModelIds: ['model-a', 'ghost'],
+                },
+            });
+            const result = validateByokConfigRefs(config);
+            expect(result.valid).toBe(false);
+            expect(result.errors).toHaveLength(1);
+            expect(result.errors[0]).toContain('routing.fallbackModelIds');
+            expect(result.errors[0]).toContain('ghost');
+        });
+
+        it('fails a list head that is not mirrored in fallbackModelId', () => {
+            const result = validateByokConfigRefs(
+                v2({ routing: { fallbackModelIds: ['ghost'] } }),
+            );
+            expect(result.valid).toBe(false);
+            expect(result.errors[0]).toContain('ghost');
+        });
+
+        it('fails a chain longer than MAX_FALLBACKS', () => {
+            const ids = ['m1', 'm2', 'm3', 'm4'];
+            const config = v2({
+                models: ids.map((id) => ({
+                    id,
+                    credentialId: 'cred-openai',
+                    model: 'gpt-5',
+                })),
+                routing: { fallbackModelId: 'm1', fallbackModelIds: ids },
+            });
+            const result = validateByokConfigRefs(config);
+            expect(result.valid).toBe(false);
+            expect(result.errors).toEqual([
+                expect.stringContaining(`at most ${MAX_FALLBACKS}`),
+            ]);
+        });
+
+        it('passes a full chain of resolvable models', () => {
+            const ids = ['m1', 'm2', 'm3'];
+            const config = v2({
+                models: ids.map((id) => ({
+                    id,
+                    credentialId: 'cred-openai',
+                    model: 'gpt-5',
+                })),
+                routing: { fallbackModelId: 'm1', fallbackModelIds: ids },
+            });
+            expect(validateByokConfigRefs(config)).toEqual({
+                valid: true,
+                errors: [],
+            });
+        });
+
         it('fails when a taskOverride points at a missing model, naming the task', () => {
             const config = v2({
                 routing: { taskOverrides: { conversation: 'ghost-model' } },
@@ -161,6 +217,23 @@ describe('findModelReferences', () => {
         expect(refs).toContain('your fallback model');
         expect(refs).toContain('the Code Review model');
         expect(refs).not.toContain('the PR Summary model');
+    });
+
+    it('reports the chain head but not a tail entry (the delete prunes the tail)', () => {
+        const config = v2({
+            models: [
+                { id: 'model-a', credentialId: 'cred-openai', model: 'gpt-5' },
+                { id: 'model-b', credentialId: 'cred-openai', model: 'gpt-5-mini' },
+            ],
+            routing: {
+                fallbackModelId: 'model-a',
+                fallbackModelIds: ['model-a', 'model-b'],
+            },
+        });
+        expect(findModelReferences(config, 'model-a')).toEqual([
+            'your fallback model',
+        ]);
+        expect(findModelReferences(config, 'model-b')).toEqual([]);
     });
 
     it('returns [] when no routing ref points at the model', () => {

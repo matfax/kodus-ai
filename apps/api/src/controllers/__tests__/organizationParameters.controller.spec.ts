@@ -20,7 +20,7 @@ describe('OrganizationParametersController.deleteByokConfig — v2 { modelId } r
         request = {
             user: { organization: { uuid: orgId } },
         };
-        // Only deleteByokConfigUseCase (arg 5) and request (last arg) are
+        // Only deleteByokConfigUseCase (arg 5) and request (arg 16) are
         // exercised by this route; the rest are irrelevant here.
         controller = new OrganizationParametersController(
             undefined as any, // createOrUpdateOrganizationParametersUseCase
@@ -39,6 +39,7 @@ describe('OrganizationParametersController.deleteByokConfig — v2 { modelId } r
             undefined as any, // ignoreBotsUseCase
             undefined as any, // updateAutoLicenseAllowedUsersUseCase
             request as any,
+            undefined as any, // setByokFallbackChainUseCase
         );
     }
 

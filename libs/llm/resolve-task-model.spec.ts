@@ -140,8 +140,8 @@ describe('resolveTaskSlot', () => {
         });
     });
 
-    describe('runtime fallback (slot.fallback)', () => {
-        it('stamps a distinct, eligible fallback onto slot.fallback', () => {
+    describe('runtime fallback chain (slot.fallbacks)', () => {
+        it('stamps a distinct, eligible fallback onto slot.fallbacks', () => {
             const res = resolveTaskSlot(
                 v2({ defaultModelId: 'm-A', fallbackModelId: 'm-B' }),
                 'codeReview',
@@ -152,14 +152,17 @@ describe('resolveTaskSlot', () => {
             expect(res.slot?.model).toBe('gpt-4o');
             expect(res.slot?.usedFallback).toBe(false);
             // fallback rides inside the slot: distinct model, task-tagged, flagged
-            // usedFallback, ciphertext preserved. The one-hop invariant (no nested
-            // fallback) is enforced by the TYPE now — `Omit<NormalizedModel,
-            // 'fallback'>` makes `.fallback.fallback` a compile error, so there is
-            // nothing to assert at runtime.
-            expect(res.slot?.fallback?.model).toBe('gpt-5-mini');
-            expect(res.slot?.fallback?.route).toBe('codeReview');
-            expect(res.slot?.fallback?.usedFallback).toBe(true);
-            expect(res.slot?.fallback?.apiKey).toBe('enc-oa');
+            // usedFallback, ciphertext preserved. The no-nesting invariant is
+            // enforced by the TYPE — `Omit<NormalizedModel, 'fallbacks'>` makes
+            // `.fallbacks[0].fallbacks` a compile error, so there is nothing to
+            // assert at runtime.
+            expect(res.slot?.fallbacks).toHaveLength(1);
+            const [fallback] = res.slot?.fallbacks ?? [];
+            expect(fallback.model).toBe('gpt-5-mini');
+            expect(fallback.route).toBe('codeReview');
+            expect(fallback.usedFallback).toBe(true);
+            expect(fallback.apiKey).toBe('enc-oa');
+            expect(fallback.chainIndex).toBe(0);
         });
 
         it('omits fallback when none is configured', () => {
@@ -168,7 +171,7 @@ describe('resolveTaskSlot', () => {
                 'codeReview',
                 {},
             );
-            expect(res.slot?.fallback).toBeUndefined();
+            expect(res.slot?.fallbacks).toBeUndefined();
         });
 
         it('omits fallback when it resolves to the same model as the primary', () => {
@@ -178,7 +181,7 @@ describe('resolveTaskSlot', () => {
                 {},
             );
             expect(res.slot?.model).toBe('gpt-4o');
-            expect(res.slot?.fallback).toBeUndefined();
+            expect(res.slot?.fallbacks).toBeUndefined();
         });
 
         it('omits fallback when the configured fallback fails the gate', () => {
@@ -201,7 +204,7 @@ describe('resolveTaskSlot', () => {
                 {},
             );
             expect(res.slot?.model).toBe('gpt-4o');
-            expect(res.slot?.fallback).toBeUndefined();
+            expect(res.slot?.fallbacks).toBeUndefined();
         });
 
         it('omits fallback when the model that WON is already the fallback', () => {
@@ -214,7 +217,87 @@ describe('resolveTaskSlot', () => {
             );
             expect(res.slot?.model).toBe('gpt-5-mini');
             expect(res.slot?.usedFallback).toBe(true);
-            expect(res.slot?.fallback).toBeUndefined();
+            expect(res.slot?.fallbacks).toBeUndefined();
+        });
+
+        const chainModels = [
+            { id: 'm-A', credentialId: 'c-oa', model: 'gpt-4o' },
+            { id: 'm-B', credentialId: 'c-oa', model: 'gpt-5-mini' },
+            { id: 'm-C', credentialId: 'c-an', model: 'claude-x' },
+            { id: 'm-D', credentialId: 'c-oa', model: 'gpt-5-nano' },
+            { id: 'm-E', credentialId: 'c-oa', model: 'gpt-5-pro' },
+            { id: 'm-M', credentialId: 'c-m', model: 'gpt-4o' },
+            // Same served route as m-B under another id.
+            { id: 'm-B2', credentialId: 'c-oa', model: 'gpt-5-mini' },
+        ];
+        const chainCreds = [
+            { id: 'c-oa', provider: 'openai', apiKey: 'enc-oa' },
+            { id: 'c-an', provider: 'anthropic', apiKey: 'enc-an' },
+            { id: 'c-m', provider: 'openai', managed: true },
+        ];
+        const chained = (routing: any) =>
+            resolveTaskSlot(v2(routing, chainModels, chainCreds), 'codeReview', {});
+        const chainOf = (res: ReturnType<typeof resolveTaskSlot>) =>
+            (res.slot?.fallbacks ?? []).map((f) => [f.byokModelId, f.chainIndex]);
+
+        it('attaches every eligible chain entry, in order, with its chain index', () => {
+            const res = chained({
+                defaultModelId: 'm-A',
+                fallbackModelIds: ['m-B', 'm-C', 'm-D'],
+            });
+            expect(chainOf(res)).toEqual([
+                ['m-B', 0],
+                ['m-C', 1],
+                ['m-D', 2],
+            ]);
+            expect(res.slot?.fallbacks?.[1]?.provider).toBe('anthropic');
+        });
+
+        it('gates each entry on its own: a gated-out entry is skipped, later ones kept', () => {
+            const res = chained({
+                defaultModelId: 'm-A',
+                fallbackModelIds: ['m-M', 'm-C'],
+            });
+            expect(chainOf(res)).toEqual([['m-C', 1]]);
+        });
+
+        it('dedupes against the primary and against what an earlier entry serves', () => {
+            const res = chained({
+                defaultModelId: 'm-A',
+                fallbackModelIds: ['m-A', 'm-B', 'm-B2', 'm-C'],
+            });
+            // m-A is the primary; m-B2 serves the same route as m-B. The cap
+            // (MAX_FALLBACKS = 3) stops before m-C.
+            expect(chainOf(res)).toEqual([['m-B', 1]]);
+        });
+
+        it('caps the chain at MAX_FALLBACKS', () => {
+            const res = chained({
+                defaultModelId: 'm-A',
+                fallbackModelIds: ['m-B', 'm-C', 'm-D', 'm-E'],
+            });
+            expect(chainOf(res).map(([id]) => id)).toEqual(['m-B', 'm-C', 'm-D']);
+        });
+
+        it('a gate-time winner at chain entry k keeps only the entries after k', () => {
+            // The primary tier is gated out (managed), so the gate walks the
+            // chain: m-M is gated too, m-B wins at k = 1; m-C and m-D remain.
+            const res = chained({
+                defaultModelId: 'm-M',
+                fallbackModelIds: ['m-M', 'm-B', 'm-C', 'm-D'],
+            });
+            expect(res.verdict?.modelId).toBe('m-B');
+            expect(res.slot?.usedFallback).toBe(true);
+            expect(chainOf(res)).toEqual([
+                ['m-C', 2],
+            ]);
+        });
+
+        it('a legacy single-fallback config gives the same slot as before the chain', () => {
+            const legacy = chained({ defaultModelId: 'm-A', fallbackModelId: 'm-B' });
+            const asList = chained({ defaultModelId: 'm-A', fallbackModelIds: ['m-B'] });
+            expect(asList).toEqual(legacy);
+            expect(chainOf(legacy)).toEqual([['m-B', 0]]);
         });
     });
 
@@ -577,8 +660,8 @@ describe('resolveTaskSlot — an OpenAI-compatible credential on OpenAI itself',
         const { slot } = resolveTaskSlot(compat('https://api.openai.com/v1', 'gpt-6-sol'), 'codeReview', {});
         expect(slot).toMatchObject({ provider: 'openai', model: 'gpt-6-sol', apiKey: 'enc-cp', byokModelId: 'm-C', credentialId: 'c-cp' });
         expect(slot?.baseURL).toBeUndefined();
-        expect(slot?.fallback).toMatchObject({ provider: 'openai', model: 'gpt-6-sol-fallback' });
-        expect(slot?.fallback?.baseURL).toBeUndefined();
+        expect(slot?.fallbacks?.[0]).toMatchObject({ provider: 'openai', model: 'gpt-6-sol-fallback' });
+        expect(slot?.fallbacks?.[0]?.baseURL).toBeUndefined();
     });
 
     it('moves an override pasted for the compatible adapter under openai, only when the slot is served as openai', () => {

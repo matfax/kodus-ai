@@ -133,8 +133,12 @@ jobs:
                   export const environment = devEnvironment;
                   EOF
 
+            # pgvector and the migrations run for fork PRs too: both only need
+            # the compose Postgres and the .env written above (the fork .env
+            # matches docker-compose.test.yml, and migration:run reaches it on
+            # localhost). Skipping them left every real-Postgres integration
+            # spec failing with `relation "..." does not exist` on fork PRs.
             - name: Enable pgvector extension
-              if: github.event.pull_request.head.repo.fork == false
               run: |
                   source .env
                   docker exec -e PGPASSWORD="$API_PG_DB_PASSWORD" postgres \
@@ -142,7 +146,6 @@ jobs:
                     -c "CREATE EXTENSION IF NOT EXISTS vector;"
 
             - name: Run migrations
-              if: github.event.pull_request.head.repo.fork == false
               # Mongo lives on the docker network (db_mongodb), unreachable from
               # this host step — skip the Mongo migrations here (their modules are
               # covered by mongo-migrations.integration.spec). Postgres migrations

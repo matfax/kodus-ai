@@ -78,9 +78,18 @@ export interface BYOKRouting {
     taskOverrides?: Partial<Record<LlmTask, string>>;
     /** Default model id when a task has no explicit override. */
     defaultModelId?: string;
-    /** Single fallback model id used when the resolved tier fails the capability
-     *  gate and no higher-precedence capable model exists (REQ-ROUTE-01). */
+    /** The HEAD of the fallback chain: the model used when the resolved tier
+     *  fails the capability gate and no higher-precedence capable model exists
+     *  (REQ-ROUTE-01), and the first model a failed call cascades to. Kept for
+     *  every reader that predates the chain (the enterprise routing tab, the
+     *  audit log); after a write it always equals `fallbackModelIds[0]`. */
     fallbackModelId?: string;
+    /** The ordered fallback CHAIN (`models[]` ids, at most MAX_FALLBACKS), head
+     *  first. Stored only when the chain has more than one entry, so a
+     *  single-fallback config keeps its old shape. Read it through
+     *  `fallbackChainOf` (byok-fallback-chain.ts), never directly: that is
+     *  where the head, dedupe and cap rules live. */
+    fallbackModelIds?: string[];
 }
 
 export interface BYOKConfig {
@@ -157,18 +166,26 @@ export interface NormalizedModel {
      *    tier — makes a silent primary→fallback swap visible on the span. */
     route?: string;
     usedFallback?: boolean;
-    /** The RUNTIME failover target for this slot: the org's configured
-     *  `routing.fallbackModelId`, resolved + capability-gated, stamped here by
-     *  `resolveTaskSlot` so it rides ALONG the primary slot to `LLM.run` with no
-     *  per-consumer threading. Present only when a distinct, eligible fallback
-     *  exists (absent when none is configured, it fails the gate, or the primary
-     *  IS already the fallback). Itself a plain slot — never carries a nested
-     *  `.fallback` (the cascade is at most primary → fallback, one hop). `LLM.run`
-     *  tries the primary, then this on a cascade-worthy failure. Typed as a slot
-     *  WITHOUT its own `.fallback` so the compiler — not a prose invariant —
-     *  enforces the single hop. */
-    fallback?: Omit<NormalizedModel, 'fallback'>;
+    /** The RUNTIME failover chain for this slot: the org's configured fallback
+     *  chain (`fallbackChainOf(routing)`), each entry resolved +
+     *  capability-gated, stamped here by `resolveTaskSlot` so it rides ALONG
+     *  the primary slot to `LLM.run` with no per-consumer threading. In the
+     *  order `LLM.run` tries them after the primary. Only distinct, eligible
+     *  entries appear (one that fails the gate or serves the same model as the
+     *  primary or an earlier entry is dropped); absent when none qualifies.
+     *  When the routing gate already picked chain entry k, only the entries
+     *  after k are here. Each entry is a plain slot that never carries its own
+     *  `.fallbacks` — the compiler, not a prose invariant, forbids nesting.
+     *  `chainIndex` is the entry's position in the configured chain
+     *  (0 = `routing.fallbackModelId`). */
+    fallbacks?: ReadonlyArray<FallbackSlot>;
 }
+
+/** One runtime fallback entry: a slot without its own chain, plus its
+ *  position in the org's configured fallback chain. */
+export type FallbackSlot = Omit<NormalizedModel, 'fallbacks'> & {
+    chainIndex: number;
+};
 
 /** Narrow an unknown blob to a valid BYOK config by its schema discriminant. */
 export function isByokConfig(raw: unknown): raw is BYOKConfig {

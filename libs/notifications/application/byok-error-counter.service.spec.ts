@@ -61,6 +61,29 @@ describe('ByokErrorCounter', () => {
         expect(notifications.emit).not.toHaveBeenCalled();
     });
 
+    it('does not count a round-trip deadline kill: the call moved on to the next chain entry', async () => {
+        // The deadline is only ever armed on an entry that has a next one, so
+        // the review went on there; counting it would alarm owners over a
+        // fallback that took over.
+        cache.getFromCache.mockResolvedValue(
+            Array.from({ length: BYOK_ERROR_THRESHOLD }, () => ({
+                ts: NOW,
+                provider: PROVIDER,
+                error: ERROR,
+            })),
+        );
+        await counter.record({
+            organizationId: ORG,
+            provider: PROVIDER,
+            errorMessage: '[PROVIDER-DEADLINE] openai/gpt gave no answer',
+            category: 'TRANSIENT',
+            deadline: true,
+        });
+        expect(cache.getFromCache).not.toHaveBeenCalled();
+        expect(cache.addToCache).not.toHaveBeenCalled();
+        expect(notifications.emit).not.toHaveBeenCalled();
+    });
+
     it('appends the current timestamp to the rolling list and persists with the window TTL', async () => {
         cache.getFromCache.mockResolvedValueOnce(null);
 

@@ -122,3 +122,64 @@ describe('fake llm — over HTTP', () => {
         expect(res.status).toBe(404);
     });
 });
+
+// The failover eval (evals/failover) reads its hops off these: an HTML 504 must
+// stay HTML (the bug was the SDK's message for it), and a hang must stay open
+// until the client gives up, not until the server's own timeout.
+describe('fake llm — faults', () => {
+    type ErrorBody = { error: { message: string } };
+    const ask = (url: string, model: string, signal?: AbortSignal) =>
+        fetch(`${url}/chat/completions`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ model, messages: [{ role: 'user', content: 'x' }] }),
+            signal,
+        });
+
+    it('answers each fault mode the way a provider in trouble does, with no retry backoff', async () => {
+        const server = await startFakeLlmServer({ fault: (body: { model: string }) => (body.model === 'ok' ? null : body.model) });
+        try {
+            const html = await ask(server.url, '504-html');
+            expect([html.status, html.statusText, html.headers.get('content-type')]).toEqual([504, 'Gateway Timeout', 'text/html']);
+            expect(await html.text()).toContain('504 Gateway Time-out');
+            expect(html.headers.get('retry-after-ms')).toBe('0');
+
+            const overloaded = await ask(server.url, '503');
+            expect(overloaded.status).toBe(503);
+            expect(((await overloaded.json()) as ErrorBody).error.message).toEqual(expect.any(String));
+            expect((await ask(server.url, '429')).status).toBe(429);
+
+            // null answers normally, so one server can fail one model and serve another.
+            expect((await ask(server.url, 'ok')).status).toBe(200);
+            expect(server.stats).toMatchObject({ requests: 4, faults: 3, byModel: { '504-html': 1, '503': 1, '429': 1, ok: 1 } });
+        } finally {
+            await server.close();
+        }
+    });
+
+    it('holds a hung request open until the client aborts it, and close() ends the rest', async () => {
+        const server = await startFakeLlmServer({ fault: 'hang' });
+        const controller = new AbortController();
+        const pending = ask(server.url, 'm', controller.signal);
+        setTimeout(() => controller.abort(), 100);
+        await expect(pending).rejects.toThrow(/abort/i);
+        const unanswered = ask(server.url, 'm').catch((error) => error);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        await server.close();
+        // fetch's own TypeError, from outside jest's realm: matched by message.
+        expect(await unanswered).toMatchObject({ message: 'fetch failed' });
+        expect(server.stats.faults).toBe(2);
+    });
+
+    it('fails loudly on a fault it does not know, instead of answering it', async () => {
+        await expect(startFakeLlmServer({ fault: 'teapot' })).rejects.toThrow(/unknown fault "teapot"/);
+        const server = await startFakeLlmServer({ fault: () => 'teapot' });
+        try {
+            const res = await ask(server.url, 'm');
+            expect(res.status).toBe(400);
+            expect(((await res.json()) as ErrorBody).error.message).toContain('unknown fault "teapot"');
+        } finally {
+            await server.close();
+        }
+    });
+});

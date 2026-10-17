@@ -4,7 +4,9 @@
  * The error classifier is MOCKED so these tests pin the primitive's OWN logic
  * (which category cascades, the loop, the unsafe-to-retry veto) independent of
  * the status→category mapping, which `error-classifier.spec.ts` owns. Categories
- * are carried on the thrown error as `__cat` and abort as `__abort`.
+ * are carried on the thrown error as `__cat`, a caller abort as `__abort` and a
+ * provider timeout as `__providerTimeout`. `__legacyAbort` drives the prose gate
+ * that `LLM_PROVIDER_TIMEOUT_CASCADE=off` restores.
  */
 // One stable spy per module load (the factory closes over it and `createLogger`
 // always returns it) so tests can assert the [LLM-ERROR]/[LLM-SUCCESS]
@@ -14,6 +16,7 @@
 jest.mock('@libs/core/log/logger', () => {
     const log = {
         warn: jest.fn(),
+        log: jest.fn(),
         info: jest.fn(),
         error: jest.fn(),
         debug: jest.fn(),
@@ -42,25 +45,35 @@ jest.mock('@libs/llm/error-classifier', () => {
         LlmErrorCategory,
         classifyLLMError: (e: any) => ({ category: e?.__cat ?? 'UNKNOWN' }),
         isTerminalCategory: (c: string) => TERMINAL.has(c),
-        isAbortOrHardTimeout: (e: any) => e?.__abort === true,
+        isAbortOrHardTimeout: (e: any) =>
+            e?.__abort === true || e?.__legacyAbort === true,
+        isCallerAbortOrBudget: (e: any) => e?.__abort === true,
+        isProviderTimeout: (e: any) => e?.__providerTimeout === true,
         retriesWereExhausted: (e: any) => e?.__exhausted === true,
+        // The breaker reads the chain for our deadline; one layer is enough.
+        failureChain: (e: any) => (e && typeof e === 'object' ? [e] : []),
     };
 });
 
+import { ProviderDeadlineError } from './provider-deadline-error';
 import {
+    providerTimeoutCascadeEnabled,
     readAttemptedSlot,
+    readFailoverHops,
     recordModelFailovers,
     runWithModelFailover,
     shouldFailoverToNextModel,
     type FailoverAttemptControl,
 } from './model-failover';
 import type { NormalizedModel } from './byok-config';
+import { providerCircuit } from './provider-circuit';
 import { createLogger } from '@libs/core/log/logger';
 
 // The mocked createLogger always returns the same spy instance model-failover
 // captured at module load, so this is that exact instance.
 const mockLog = createLogger('test') as unknown as {
     warn: jest.Mock;
+    log: jest.Mock;
     info: jest.Mock;
     error: jest.Mock;
     debug: jest.Mock;
@@ -120,6 +133,79 @@ describe('shouldFailoverToNextModel', () => {
             shouldFailoverToNextModel(err('TRANSIENT', { __abort: true })),
         ).toBe(false);
     });
+
+    it('cascades on a provider timeout whatever its category reads', () => {
+        // A 504/408/undici timeout is the route being down, not the budget.
+        expect(
+            shouldFailoverToNextModel(
+                err('UNKNOWN', { __providerTimeout: true }),
+            ),
+        ).toBe(true);
+    });
+
+    it('lets a caller abort win over a provider timeout it wraps', () => {
+        expect(
+            shouldFailoverToNextModel(
+                err('TRANSIENT', { __abort: true, __providerTimeout: true }),
+            ),
+        ).toBe(false);
+    });
+
+    it('does not read the prose gate while the cascade is on', () => {
+        // The old regex matched "Gateway Timeout"; it no longer vetoes.
+        expect(
+            shouldFailoverToNextModel(
+                err('TRANSIENT', { __legacyAbort: true }),
+            ),
+        ).toBe(true);
+    });
+
+    describe('LLM_PROVIDER_TIMEOUT_CASCADE=off', () => {
+        const saved = process.env.LLM_PROVIDER_TIMEOUT_CASCADE;
+        beforeEach(() => {
+            process.env.LLM_PROVIDER_TIMEOUT_CASCADE = 'off';
+        });
+        afterEach(() => {
+            if (saved === undefined) {
+                delete process.env.LLM_PROVIDER_TIMEOUT_CASCADE;
+            } else {
+                process.env.LLM_PROVIDER_TIMEOUT_CASCADE = saved;
+            }
+        });
+
+        it('restores the prose gate and ignores the provider-timeout predicate', () => {
+            expect(
+                shouldFailoverToNextModel(
+                    err('TRANSIENT', { __legacyAbort: true }),
+                ),
+            ).toBe(false);
+            expect(
+                shouldFailoverToNextModel(
+                    err('UNKNOWN', { __providerTimeout: true }),
+                ),
+            ).toBe(false);
+            expect(shouldFailoverToNextModel(err('TRANSIENT'))).toBe(true);
+        });
+    });
+});
+
+describe('providerTimeoutCascadeEnabled', () => {
+    it.each([
+        [undefined, true],
+        ['', true],
+        ['on', true],
+        ['true', true],
+        ['off', false],
+        [' OFF ', false],
+        ['false', false],
+        ['0', false],
+    ])('LLM_PROVIDER_TIMEOUT_CASCADE=%p → %p', (value, expected) => {
+        expect(
+            providerTimeoutCascadeEnabled({
+                LLM_PROVIDER_TIMEOUT_CASCADE: value,
+            }),
+        ).toBe(expected);
+    });
 });
 
 describe('runWithModelFailover', () => {
@@ -171,6 +257,27 @@ describe('runWithModelFailover', () => {
             runWithModelFailover([slot('A'), slot('B')], runOne, opts),
         ).rejects.toThrow('boom:AUTH_INVALID');
         expect(runOne).toHaveBeenCalledTimes(1);
+    });
+
+    it('tells each attempt whether a later entry will run (hasNext)', async () => {
+        const seen: boolean[] = [];
+        const runOne = jest.fn(
+            async (_s: unknown, c: FailoverAttemptControl) => {
+                seen.push(c.hasNext);
+                throw err('TRANSIENT');
+            },
+        );
+        await expect(
+            runWithModelFailover([slot('A'), slot('B')], runOne, opts),
+        ).rejects.toThrow('boom:TRANSIENT');
+        expect(seen).toEqual([true, false]);
+
+        // A fallback deduped away is no next entry.
+        seen.length = 0;
+        await expect(
+            runWithModelFailover([slot('A'), slot('A')], runOne, opts),
+        ).rejects.toThrow('boom:TRANSIENT');
+        expect(seen).toEqual([false]);
     });
 
     it('re-throws the LAST error when both the primary and fallback fail', async () => {
@@ -231,6 +338,220 @@ describe('runWithModelFailover', () => {
     });
 });
 
+describe('runWithModelFailover — an N-entry chain', () => {
+    const opts = { runName: 'chain' };
+
+    it('walks every entry in order until one answers', async () => {
+        const runOne = jest
+            .fn()
+            .mockRejectedValueOnce(err('AUTH_INVALID'))
+            .mockRejectedValueOnce(err('TRANSIENT'))
+            .mockRejectedValueOnce(err('QUOTA_EXCEEDED'))
+            .mockResolvedValueOnce('from-D');
+        const out = await runWithModelFailover(
+            [slot('A'), slot('B'), slot('C'), slot('D')],
+            runOne,
+            opts,
+        );
+        expect(out).toBe('from-D');
+        expect(runOne.mock.calls.map(([s]) => s.model)).toEqual([
+            'A',
+            'B',
+            'C',
+            'D',
+        ]);
+    });
+
+    it('stops at the first error that must not cascade, mid-chain', async () => {
+        const runOne = jest
+            .fn()
+            .mockRejectedValueOnce(err('TRANSIENT'))
+            .mockRejectedValueOnce(err('CONTEXT_OVERFLOW'));
+        await expect(
+            runWithModelFailover(
+                [slot('A'), slot('B'), slot('C')],
+                runOne,
+                opts,
+            ),
+        ).rejects.toThrow('boom:CONTEXT_OVERFLOW');
+        expect(runOne).toHaveBeenCalledTimes(2);
+    });
+
+    it('tells every entry but the last that a next one exists', async () => {
+        const seen: boolean[] = [];
+        const runOne = jest.fn(
+            async (_s: unknown, c: FailoverAttemptControl) => {
+                seen.push(c.hasNext);
+                throw err('TRANSIENT');
+            },
+        );
+        await expect(
+            runWithModelFailover(
+                [slot('A'), slot('B'), slot('C')],
+                runOne,
+                opts,
+            ),
+        ).rejects.toThrow();
+        expect(seen).toEqual([true, true, false]);
+    });
+
+    it('lets markUnsafeToRetry veto the cascade on a middle entry, and isUnsafe reports it', async () => {
+        const unsafe: boolean[] = [];
+        const runOne = jest
+            .fn()
+            .mockRejectedValueOnce(err('TRANSIENT'))
+            .mockImplementationOnce(
+                async (_s: unknown, c: FailoverAttemptControl) => {
+                    unsafe.push(c.isUnsafe());
+                    c.markUnsafeToRetry();
+                    unsafe.push(c.isUnsafe());
+                    throw err('TRANSIENT');
+                },
+            );
+        await expect(
+            runWithModelFailover(
+                [slot('A'), slot('B'), slot('C')],
+                runOne,
+                opts,
+            ),
+        ).rejects.toThrow('boom:TRANSIENT');
+        expect(runOne).toHaveBeenCalledTimes(2);
+        expect(unsafe).toEqual([false, true]);
+    });
+
+    it('does not start the next entry once the caller signal has aborted', async () => {
+        const controller = new AbortController();
+        const runOne = jest.fn(async () => {
+            controller.abort();
+            throw err('TRANSIENT');
+        });
+        await expect(
+            runWithModelFailover([slot('A'), slot('B'), slot('C')], runOne, {
+                ...opts,
+                signal: controller.signal,
+            }),
+        ).rejects.toThrow('boom:TRANSIENT');
+        expect(runOne).toHaveBeenCalledTimes(1);
+    });
+
+    it('stops between later hops too when the caller aborts', async () => {
+        const controller = new AbortController();
+        const runOne = jest
+            .fn()
+            .mockRejectedValueOnce(err('TRANSIENT'))
+            .mockImplementationOnce(async () => {
+                controller.abort();
+                throw err('TRANSIENT');
+            });
+        const thrown = await runWithModelFailover(
+            [slot('A'), slot('B'), slot('C')],
+            runOne,
+            { ...opts, signal: controller.signal },
+        ).catch((e) => e);
+        expect(runOne).toHaveBeenCalledTimes(2);
+        expect(readAttemptedSlot(thrown)).toMatchObject({ model: 'B' });
+    });
+
+    it('records the hops before the entry that answered', async () => {
+        const { failovers } = await recordModelFailovers(() =>
+            runWithModelFailover(
+                [slot('A'), slot('B'), slot('C')],
+                jest
+                    .fn()
+                    .mockRejectedValueOnce(err('AUTH_INVALID'))
+                    .mockRejectedValueOnce(
+                        err('TRANSIENT', { __providerTimeout: true }),
+                    )
+                    .mockResolvedValueOnce('ok'),
+                opts,
+            ),
+        );
+        expect(failovers).toHaveLength(1);
+        expect(failovers[0]).toMatchObject({
+            failedModel: 'A',
+            usedModel: 'C',
+            chainIndex: 2,
+        });
+        expect(
+            failovers[0].hops.map((h) => [h.model, h.chainIndex, h.reason]),
+        ).toEqual([
+            ['A', 0, 'AUTH_INVALID'],
+            ['B', 1, 'provider-timeout'],
+        ]);
+    });
+
+    it('names a round-trip deadline as its own hop reason', async () => {
+        const deadline = new ProviderDeadlineError({
+            deadlineMs: 1000,
+            source: 'round-trip',
+            phase: 'round-trip',
+        });
+        Object.assign(deadline, {
+            __cat: 'TRANSIENT',
+            __providerTimeout: true,
+        });
+        const { failovers } = await recordModelFailovers(() =>
+            runWithModelFailover(
+                [slot('A'), slot('B')],
+                jest
+                    .fn()
+                    .mockRejectedValueOnce(deadline)
+                    .mockResolvedValueOnce('ok'),
+                opts,
+            ),
+        );
+        expect(failovers[0].hops[0].reason).toBe('deadline');
+    });
+
+    it('stamps every hop on the error after a terminal failure, and lists them in the warn', async () => {
+        mockLog.warn.mockClear();
+        const thrown = await runWithModelFailover(
+            [slot('A'), slot('B'), slot('C')],
+            jest
+                .fn()
+                .mockRejectedValueOnce(err('AUTH_INVALID'))
+                .mockRejectedValueOnce(err('TRANSIENT'))
+                .mockRejectedValueOnce(err('QUOTA_EXCEEDED')),
+            opts,
+        ).catch((e) => e);
+        expect(readFailoverHops(thrown)?.map((h) => h.model)).toEqual([
+            'A',
+            'B',
+            'C',
+        ]);
+        expect(Object.keys(thrown)).not.toContain('hops');
+        const terminal = mockLog.warn.mock.calls.at(-1)[0];
+        expect(terminal.message).toContain(
+            '[after: "A" failed (AUTH_INVALID), "B" failed (TRANSIENT)]',
+        );
+        expect(terminal.metadata.chainIndex).toBe(2);
+        expect(terminal.metadata.hops).toHaveLength(3);
+    });
+
+    it('carries chainIndex and reason on each cascade warn', async () => {
+        mockLog.warn.mockClear();
+        await runWithModelFailover(
+            [slot('A'), slot('B'), slot('C')],
+            jest
+                .fn()
+                .mockRejectedValueOnce(err('AUTH_INVALID'))
+                .mockRejectedValueOnce(err('TRANSIENT'))
+                .mockResolvedValueOnce('ok'),
+            opts,
+        );
+        expect(
+            mockLog.warn.mock.calls.map(([c]) => [
+                c.metadata.chainIndex,
+                c.metadata.reason,
+                c.metadata.toModelId,
+            ]),
+        ).toEqual([
+            [0, 'AUTH_INVALID', 'B'],
+            [1, 'TRANSIENT', 'C'],
+        ]);
+    });
+});
+
 describe('recordModelFailovers (#2066)', () => {
     const opts = { runName: 'code-review-bug' };
 
@@ -248,7 +569,21 @@ describe('recordModelFailovers (#2066)', () => {
 
         expect(value).toBe('from-fallback');
         expect(failovers).toEqual([
-            { runName: 'code-review-bug', failedModel: 'A', usedModel: 'B' },
+            {
+                runName: 'code-review-bug',
+                failedModel: 'A',
+                usedModel: 'B',
+                chainIndex: 1,
+                hops: [
+                    {
+                        model: 'A',
+                        chainIndex: 0,
+                        outcome: 'failed',
+                        reason: 'AUTH_INVALID',
+                        elapsedMs: expect.any(Number),
+                    },
+                ],
+            },
         ]);
     });
 
@@ -489,5 +824,137 @@ describe('the failed attempt is recorded ON the error', () => {
         expect(readAttemptedSlot(new Error('unrelated'))).toBeUndefined();
         expect(readAttemptedSlot(undefined)).toBeUndefined();
         expect(readAttemptedSlot('a string')).toBeUndefined();
+    });
+});
+
+describe('runWithModelFailover — the circuit breaker', () => {
+    // One counted failure opens a key, so each test can set its state up in a
+    // single call. The mocked classifier counts TRANSIENT.
+    const opts = { runName: 'test', organizationId: 'org-1' };
+    const env = { ...process.env };
+    beforeEach(() => {
+        process.env.LLM_CIRCUIT_FAILURE_THRESHOLD = '1';
+        delete process.env.LLM_CIRCUIT_MODE;
+        providerCircuit.reset();
+    });
+    afterEach(() => {
+        process.env = { ...env };
+        providerCircuit.reset();
+    });
+
+    /** Open the breaker on `model` by failing it once as a non-last entry. */
+    async function openOn(model: string): Promise<void> {
+        await runWithModelFailover(
+            [slot(model), slot('opener-fallback')],
+            jest
+                .fn()
+                .mockRejectedValueOnce(err('TRANSIENT'))
+                .mockResolvedValueOnce('ok'),
+            opts,
+        );
+    }
+
+    it('skips an open entry and records the skip as a hop', async () => {
+        await openOn('A');
+        const runOne = jest.fn().mockResolvedValue('ok');
+        const { failovers } = await recordModelFailovers(() =>
+            runWithModelFailover([slot('A'), slot('B')], runOne, opts),
+        );
+        expect(runOne).toHaveBeenCalledTimes(1);
+        expect(runOne.mock.calls[0][0].model).toBe('B');
+        expect(failovers[0].hops).toEqual([
+            expect.objectContaining({
+                model: 'A',
+                outcome: 'skipped',
+                reason: 'circuit-open',
+            }),
+        ]);
+        // The attempt that ran knows why it is running.
+        expect(runOne.mock.calls[0][1]).toMatchObject({
+            chainIndex: 1,
+            failoverReason: 'circuit-open',
+        });
+    });
+
+    it('never skips the last entry', async () => {
+        await openOn('A');
+        const runOne = jest.fn().mockResolvedValue('ok');
+        await expect(
+            runWithModelFailover([slot('A')], runOne, opts),
+        ).resolves.toBe('ok');
+        expect(runOne).toHaveBeenCalledTimes(1);
+        expect(runOne.mock.calls[0][1].circuitState).toBe('open');
+    });
+
+    it('runs the last entry forced when every entry is open', async () => {
+        await openOn('A');
+        await openOn('B');
+        const runOne = jest.fn().mockResolvedValue('ok');
+        const { failovers } = await recordModelFailovers(() =>
+            runWithModelFailover([slot('A'), slot('B')], runOne, opts),
+        );
+        expect(runOne.mock.calls.map((c) => c[0].model)).toEqual(['B']);
+        expect(failovers[0].hops.map((h) => h.outcome)).toEqual(['skipped']);
+    });
+
+    it('shadow mode runs everything', async () => {
+        process.env.LLM_CIRCUIT_MODE = 'shadow';
+        await openOn('A');
+        mockLog.log.mockClear();
+        const runOne = jest.fn().mockResolvedValue('ok');
+        await runWithModelFailover([slot('A'), slot('B')], runOne, opts);
+        expect(runOne.mock.calls.map((c) => c[0].model)).toEqual(['A']);
+        expect(
+            mockLog.log.mock.calls.some((c) =>
+                String(c[0]?.message).includes('would-skip'),
+            ),
+        ).toBe(true);
+    });
+
+    it('does not count an uncounted category (rate limit, abort)', async () => {
+        for (const e of [
+            err('RATE_LIMIT'),
+            err('TRANSIENT', { __abort: true }),
+        ]) {
+            await runWithModelFailover(
+                [slot('A'), slot('B')],
+                jest.fn().mockRejectedValueOnce(e).mockResolvedValue('ok'),
+                opts,
+            ).catch(() => undefined);
+        }
+        const runOne = jest.fn().mockResolvedValue('ok');
+        await runWithModelFailover([slot('A'), slot('B')], runOne, opts);
+        expect(runOne.mock.calls[0][0].model).toBe('A');
+    });
+
+    it('still counts a failure after markUnsafeToRetry', async () => {
+        await runWithModelFailover(
+            [slot('A'), slot('B')],
+            async (_s, control: FailoverAttemptControl) => {
+                control.markUnsafeToRetry();
+                throw err('TRANSIENT');
+            },
+            opts,
+        ).catch(() => undefined);
+        const runOne = jest.fn().mockResolvedValue('ok');
+        await runWithModelFailover([slot('A'), slot('B')], runOne, opts);
+        expect(runOne.mock.calls[0][0].model).toBe('B');
+    });
+
+    it('applies no breaker without an org', async () => {
+        await runWithModelFailover(
+            [slot('A'), slot('B')],
+            jest
+                .fn()
+                .mockRejectedValueOnce(err('TRANSIENT'))
+                .mockResolvedValueOnce('ok'),
+            { runName: 'test' },
+        );
+        const runOne = jest.fn().mockResolvedValue('ok');
+        await runWithModelFailover([slot('A'), slot('B')], runOne, {
+            runName: 'test',
+        });
+        expect(runOne.mock.calls[0][0].model).toBe('A');
+        expect(runOne.mock.calls[0][1].circuitState).toBeUndefined();
     });
 });

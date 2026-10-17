@@ -16,6 +16,17 @@
  */
 import { AGENT_TIMEOUT_MS, LLM_CALL_TIMEOUT_MS, EMBED_TIMEOUT_MS } from '@libs/llm/llm-call';
 import { PROBE_TIMEOUT_MS } from '@libs/llm/probe-slot-call';
+import { MAX_FALLBACKS } from '@libs/llm/byok-fallback-chain';
+import {
+    DEFAULT_ROUND_TRIP_DEADLINE_MS,
+    MAX_ROUND_TRIP_DEADLINE_MS,
+    ROUND_TRIP_SETTLE_GRACE_MS,
+    failoverRoundTripDeadlineMs,
+} from '@libs/llm/provider-deadline-error';
+
+// undici headersTimeout (fetch-timeouts.ts), mirrored for the same reason as
+// the job timeout below.
+const UNDICI_HEADERS_TIMEOUT_MS = 20 * 60 * 1000;
 
 // Mirrored from job-processor-router.service.ts. Duplicated on purpose: libs/llm
 // must not depend on the workflow layer, and a silent drift here is exactly
@@ -67,5 +78,55 @@ describe('LLM timeout hierarchy — every layer leaves room for the one inside',
     it('gives the probe room for a thinking model without ceasing to be interactive', () => {
         expect(PROBE_TIMEOUT_MS).toBeGreaterThanOrEqual(60 * 1000);
         expect(PROBE_TIMEOUT_MS).toBeLessThanOrEqual(2 * 60 * 1000);
+    });
+
+    describe('the failover round-trip deadline', () => {
+        // It exists to buy a cascade. If it were not inside the call budget,
+        // the call budget (or undici beside it) would fire first, as a plain
+        // timeout that does not cascade.
+        it('sits strictly inside one model round-trip, which sits inside undici and the loop', () => {
+            expect(MAX_ROUND_TRIP_DEADLINE_MS).toBeLessThan(
+                LLM_CALL_TIMEOUT_MS,
+            );
+            expect(LLM_CALL_TIMEOUT_MS).toBeLessThanOrEqual(
+                UNDICI_HEADERS_TIMEOUT_MS,
+            );
+            expect(UNDICI_HEADERS_TIMEOUT_MS).toBeLessThan(AGENT_TIMEOUT_MS);
+        });
+
+        it('leaves the last chain entry half the loop budget, even when every other entry stalls', () => {
+            expect(
+                MAX_FALLBACKS * MAX_ROUND_TRIP_DEADLINE_MS,
+            ).toBeLessThanOrEqual(AGENT_TIMEOUT_MS / 2);
+        });
+
+        it('defaults to 5 minutes, inside the clamp, with room for the settle grace', () => {
+            expect(DEFAULT_ROUND_TRIP_DEADLINE_MS).toBe(5 * 60 * 1000);
+            expect(DEFAULT_ROUND_TRIP_DEADLINE_MS).toBeLessThanOrEqual(
+                MAX_ROUND_TRIP_DEADLINE_MS,
+            );
+            expect(
+                MAX_ROUND_TRIP_DEADLINE_MS + ROUND_TRIP_SETTLE_GRACE_MS,
+            ).toBeLessThan(LLM_CALL_TIMEOUT_MS);
+        });
+
+        it('reads the knob, turns off on 0/off, and clamps what is too large', () => {
+            const knob = (v?: string) =>
+                failoverRoundTripDeadlineMs(
+                    v === undefined
+                        ? {}
+                        : { LLM_FAILOVER_ROUND_TRIP_DEADLINE_MS: v },
+                );
+            expect(knob()).toBe(DEFAULT_ROUND_TRIP_DEADLINE_MS);
+            expect(knob('')).toBe(DEFAULT_ROUND_TRIP_DEADLINE_MS);
+            expect(knob('90000')).toBe(90_000);
+            expect(knob('0')).toBeUndefined();
+            expect(knob('0.0')).toBeUndefined();
+            expect(knob('off')).toBeUndefined();
+            expect(knob('soon')).toBe(DEFAULT_ROUND_TRIP_DEADLINE_MS);
+            expect(knob(String(LLM_CALL_TIMEOUT_MS))).toBe(
+                MAX_ROUND_TRIP_DEADLINE_MS,
+            );
+        });
     });
 });

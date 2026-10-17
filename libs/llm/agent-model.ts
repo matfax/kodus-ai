@@ -14,7 +14,10 @@ import {
     type ByokModelOptions,
 } from '@libs/llm/byok-to-vercel';
 import type { NormalizedModel } from '@libs/llm/byok-config';
-import { wrapByokModel } from '@libs/llm/byok-model-wrapper';
+import {
+    wrapByokModel,
+    type ByokRoundTrip,
+} from '@libs/llm/byok-model-wrapper';
 
 export interface ResolveAgentModelOptions {
     organizationId?: string;
@@ -28,12 +31,16 @@ export interface ResolveAgentModelOptions {
      *  trial / public-demo override (e.g. cli-review's SUMMARY_MODEL). Threaded
      *  to `buildModelFromSlot`; ignored when a real slot resolves. */
     defaultModelOverride?: string;
+    /** The failover attempt's round-trip deadline and answer hook (set by
+     *  `LLM.run` only). Absent → no deadline. */
+    roundTrip?: ByokRoundTrip;
     /** Wire to `ByokErrorCounter.record` so BYOK failures drive the
      *  `byok.llm_errors_threshold` notification — parity with code-review. */
     reporter?: (input: {
         organizationId?: string;
         provider: string;
         errorMessage: string;
+        deadline?: boolean;
     }) => void;
 }
 
@@ -52,6 +59,7 @@ export function resolveAgentModel(
                 ? { queueTimeoutMs: opts.queueTimeoutMs }
                 : {}),
             ...(opts.reporter ? { reporter: opts.reporter } : {}),
+            ...(opts.roundTrip ? { roundTrip: opts.roundTrip } : {}),
         },
     );
 }

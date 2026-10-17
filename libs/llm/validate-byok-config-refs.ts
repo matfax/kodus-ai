@@ -8,7 +8,10 @@
  * `credentials[]` entry and every routing ref
  * (`defaultModelId` / `fallbackModelId` / `taskOverrides[*]`) resolves to a
  * `models[]` id — a dangling ref is REJECTED (not silently dropped) before
- * persist.
+ * persist. The fallback chain (`fallbackModelIds`) is gated the same way and
+ * capped at MAX_FALLBACKS; the write path prunes STORED tail entries that went
+ * stale before it validates (byok-fallback-chain.ts), so what fails here is
+ * only what the request itself supplied.
  *
  * Secret hygiene: error strings name ids ONLY (model id, credentialId, routing
  * key) — never key material.
@@ -17,6 +20,11 @@
  * (which must reject a delete that would orphan a routing ref).
  */
 import { isByokConfig, type LlmTask } from './byok-config';
+import {
+    fallbackChainOf,
+    MAX_FALLBACKS,
+    requestedFallbackChain,
+} from './byok-fallback-chain';
 
 export interface ByokRefValidationResult {
     valid: boolean;
@@ -79,6 +87,22 @@ export function validateByokConfigRefs(config: unknown): ByokRefValidationResult
                     `resolve to any model`,
             );
         }
+        const chain = requestedFallbackChain(routing);
+        if (chain.length > MAX_FALLBACKS) {
+            errors.push(
+                `routing.fallbackModelIds lists ${chain.length} fallback ` +
+                    `models; at most ${MAX_FALLBACKS} are allowed`,
+            );
+        }
+        for (const modelId of chain) {
+            // `fallbackModelId` itself was already checked above.
+            if (modelId !== routing.fallbackModelId && !modelIds.has(modelId)) {
+                errors.push(
+                    `routing.fallbackModelIds "${modelId}" does not ` +
+                        `resolve to any model`,
+                );
+            }
+        }
         for (const [task, modelId] of Object.entries(
             routing.taskOverrides ?? {},
         )) {
@@ -129,7 +153,10 @@ export function findModelReferences(
     if (routing.defaultModelId === modelId) {
         refs.push('your organization default model');
     }
-    if (routing.fallbackModelId === modelId) {
+    // Only the chain HEAD is a reference that blocks a delete: it is the one
+    // the user picked on screen. A tail entry is pruned by the delete instead
+    // (removeFromFallbackTail), since no UI shows it to be reassigned.
+    if (fallbackChainOf(routing)[0] === modelId) {
         refs.push('your fallback model');
     }
     for (const [task, id] of Object.entries(routing.taskOverrides ?? {})) {

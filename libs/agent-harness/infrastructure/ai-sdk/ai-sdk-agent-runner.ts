@@ -37,7 +37,10 @@ import type {
     TokenUsage,
     TraceEvent,
 } from '../../domain/contracts/run-state.contract';
-import type { ToolContext } from '../../domain/contracts/tool.contract';
+import type {
+    ToolContext,
+    ToolRegistry,
+} from '../../domain/contracts/tool.contract';
 import { isAiSdkToolSource } from './ai-sdk-tool-registry';
 
 export class AiSdkAgentRunner implements AgentRunner {
@@ -71,28 +74,10 @@ export class AiSdkAgentRunner implements AgentRunner {
             trace.push({ at: Date.now(), source, ...e });
 
         // --- tools ---
-        // Prefer native AI SDK tools when the registry carries them
-        // (AiSdkToolRegistry) — avoids a lossy JSON-Schema/Zod round-trip for
-        // MCP + native tool packs. Otherwise convert AgentTool -> AI SDK tool.
-        const toolMap: Record<string, any> = {};
-        if (isAiSdkToolSource(spec.tools)) {
-            Object.assign(toolMap, spec.tools.toAiSdkToolMap());
-        } else {
-            for (const t of spec.tools.list()) {
-                toolMap[t.name] = aiTool({
-                    description: t.description,
-                    inputSchema: jsonSchema(t.inputSchema as any),
-                    // Forward the tool's opt-in strict flag (set by the domain
-                    // only for strict-capable models). Providers that don't
-                    // support strict tool calling ignore it.
-                    ...(t.strict != null ? { strict: t.strict } : {}),
-                    execute: async (args: unknown) => {
-                        const r = await t.execute(args, ctx);
-                        return r.isError ? `ERROR: ${r.output}` : r.output;
-                    },
-                });
-            }
-        }
+        const toolMap = toAiSdkToolMap(spec.tools, ctx);
+        // Per-model tools: LLM.run builds the map for each failover attempt's
+        // model, so a strict done-tool never reaches a model that rejects it.
+        const toolsForModel = spec.toolsForModel;
 
         // --- seed messages ---
         const messages: ModelMessage[] = sanitizeNoSystem([
@@ -300,6 +285,12 @@ export class AiSdkAgentRunner implements AgentRunner {
                     (input.telemetry ? {} : undefined)) as any,
                 loop: {
                     tools: toolMap,
+                    ...(toolsForModel
+                        ? {
+                              toolsForModel: (modelId: string | undefined) =>
+                                  toAiSdkToolMap(toolsForModel(modelId), ctx),
+                          }
+                        : {}),
                     maxSteps: spec.maxSteps,
                     stopWhen: [policyStopWhen],
                     prepareStep: policyPrepareStep,
@@ -497,6 +488,35 @@ export class AiSdkAgentRunner implements AgentRunner {
             }
         }
     }
+}
+
+/** The AI SDK tool map for a registry. Prefers native AI SDK tools when the
+ *  registry carries them (AiSdkToolRegistry) — avoids a lossy JSON-Schema/Zod
+ *  round-trip for MCP + native tool packs. Otherwise converts AgentTool -> AI
+ *  SDK tool. */
+function toAiSdkToolMap(
+    registry: ToolRegistry,
+    ctx: ToolContext,
+): Record<string, any> {
+    if (isAiSdkToolSource(registry)) {
+        return { ...registry.toAiSdkToolMap() };
+    }
+    const toolMap: Record<string, any> = {};
+    for (const t of registry.list()) {
+        toolMap[t.name] = aiTool({
+            description: t.description,
+            inputSchema: jsonSchema(t.inputSchema as any),
+            // Forward the tool's opt-in strict flag (set by the domain only for
+            // strict-capable models). Providers that don't support strict tool
+            // calling ignore it.
+            ...(t.strict != null ? { strict: t.strict } : {}),
+            execute: async (args: unknown) => {
+                const r = await t.execute(args, ctx);
+                return r.isError ? `ERROR: ${r.output}` : r.output;
+            },
+        });
+    }
+    return toolMap;
 }
 
 /** Coerce any system-role message in a conversation array to a user turn.

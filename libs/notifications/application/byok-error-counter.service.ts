@@ -48,6 +48,8 @@ export class ByokErrorCounter {
         httpStatus?: number;
         /** The classifier found a routing refusal, not a missing model. */
         routingRefusal?: boolean;
+        /** The failover round-trip deadline killed the request. */
+        deadline?: boolean;
     }): Promise<void> {
         const {
             organizationId,
@@ -56,10 +58,16 @@ export class ByokErrorCounter {
             category,
             httpStatus,
             routingRefusal,
+            deadline,
         } = input;
         // Internal-fallback errors (no org context) are operator concern,
         // not customer concern.
         if (!organizationId) return;
+        // The deadline is only armed on a chain entry that has a next one, so
+        // a deadline kill moved the call on to that entry. Counting it would
+        // alarm owners over a fallback that took over; if that entry fails
+        // too, its own error is reported.
+        if (deadline) return;
 
         try {
             const key = `byok:errors:${organizationId}`;

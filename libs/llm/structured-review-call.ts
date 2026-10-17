@@ -23,6 +23,7 @@ import {
     type Schema,
 } from 'ai';
 import type { NormalizedModel } from '@libs/llm/byok-config';
+import type { ByokRoundTrip } from '@libs/llm/byok-model-wrapper';
 import {
     ensureValidatingSchema,
     extractJsonFromText,
@@ -69,8 +70,13 @@ import { createLogger } from '@libs/core/log/logger';
 import { zodToStrictWireSchema } from '@libs/llm/strict-wire-schema';
 import {
     classifyLLMError,
+    failureChain,
     isAbortOrHardTimeout,
+    isCallerAbortOrBudget,
+    isProviderTimeout,
 } from '@libs/llm/error-classifier';
+import { providerTimeoutCascadeEnabled } from '@libs/llm/model-failover';
+import { isProviderDeadlineError } from '@libs/llm/provider-deadline-error';
 import {
     RETRYABLE_CATEGORY,
     jitteredBackoffMs,
@@ -79,6 +85,10 @@ import {
 import { getLlmObservability } from '@libs/llm/llm-observability';
 
 const logger = createLogger('StructuredReviewCall');
+
+/** How far past an armed round-trip deadline the executor's own timers sit:
+ *  past the wrapper's settle grace, so the typed deadline error lands first. */
+const DEADLINE_EXECUTOR_MARGIN_MS = 10_000;
 
 /** Fields shared by every review call (structured or plain-text). `byokConfig`
  *  is the bare resolved slot; `buildModelFromSlot`/`getModelName` take it directly. */
@@ -136,6 +146,15 @@ export interface BaseReviewCallParams {
      *  a bare `[]` for "no violations" at scale (#1786 / prod audit 2026-09) —
      *  turning a shard error (and a false "rules not applied") into a clean pass. */
     recoverEnvelopeShape?: boolean;
+    /** Set by `LLM.run` per failover attempt: a later chain entry runs if this
+     *  call fails. D-00c then throws a provider timeout to that entry instead
+     *  of re-issuing it on the same stalled route. Unset → single entry. */
+    hasNextModel?: boolean;
+    /** Set by `LLM.run` per failover attempt: the round-trip deadline the BYOK
+     *  wrapper arms on each provider request while a cascade is possible. When
+     *  armed, the executor's own timers move past it so the typed deadline
+     *  error, which cascades, always wins over a plain timeout. */
+    roundTrip?: ByokRoundTrip;
 }
 
 export interface StructuredReviewCallParams<
@@ -352,6 +371,8 @@ async function runReviewCall<T>(
         maxOutputTokens: maxOutputTokensOverride,
         providerOptions: providerOptionsOverride,
         suppressReasoning: callerSuppressReasoning,
+        hasNextModel,
+        roundTrip,
     } = params;
 
     const mainSlot = byokConfig;
@@ -406,9 +427,30 @@ async function runReviewCall<T>(
             openrouterProviderOrder: (mainSlot as any)?.openrouterProviderOrder,
             openrouterAllowFallbacks: (mainSlot as any)
                 ?.openrouterAllowFallbacks,
+            ...(roundTrip ? { roundTrip } : {}),
         });
 
     const sentJsonSchema = structuredMode && mayUseJsonSchema(mainSlot);
+
+    // The executor's own wall clock. When the wrapper arms a round-trip
+    // deadline on this attempt (one-shot attempts never turn unsafe, so the
+    // answer holds for every request below), the timeoutSignal and the hard
+    // timeout move past it: the deadline fires, the wrapper settles a provider
+    // that ignored it 5s later, and only then could a plain timeout — which
+    // would not cascade — fire. Never shortened: queue wait, which the
+    // deadline excludes, still has the caller's whole budget.
+    const callBudgetMs = timeoutMs ?? LLM_CALL_TIMEOUT_MS;
+    const armedDeadlineMs =
+        roundTrip?.ms && roundTrip.ms > 0 && roundTrip.isActive()
+            ? roundTrip.ms
+            : undefined;
+    const executorTimeoutMs =
+        armedDeadlineMs !== undefined
+            ? Math.max(
+                  callBudgetMs,
+                  armedDeadlineMs + DEADLINE_EXECUTOR_MARGIN_MS,
+              )
+            : callBudgetMs;
 
     // What the request will ACTUALLY carry. 'json_schema' → response_format
     // holds the schema; 'none' → it rides the protocol's own channel (the
@@ -510,7 +552,10 @@ async function runReviewCall<T>(
                 // Cap hung provider calls at `timeoutMs` (default 10min) instead of
                 // the 30min agent-level fallback; also feeds the BYOK limiter
                 // cancellation. A secondary pass may pass a shorter budget.
-                abortSignal: timeoutSignal(timeoutMs ?? LLM_CALL_TIMEOUT_MS),
+                abortSignal: timeoutSignal(executorTimeoutMs),
+                ...(armedDeadlineMs !== undefined
+                    ? { __kodusHardTimeoutMs: executorTimeoutMs }
+                    : {}),
                 ...toAiSdkTelemetryArgs(
                     buildLangfuseTelemetry(
                         runName,
@@ -767,12 +812,32 @@ async function runReviewCall<T>(
         // (no 2nd model — attrs.fallback stays false).
         const category = classifyLLMError(err).category;
 
-        // Preserved verbatim (Phase 0 Pitfall 3): a genuinely aborted /
-        // hard-timed-out call is NEVER re-issued — classifyLLMError lumps
-        // AbortError / [HARD-TIMEOUT] into TRANSIENT, yet re-running a slow /
-        // already-timed-out call just burns the whole 10-min budget again. The
-        // re-issue reuses the same call() closure and its existing
-        // timeoutSignal(LLM_CALL_TIMEOUT_MS)/hardTimeout chain — no fresh budget.
+        // Phase 0 Pitfall 3: a genuinely aborted / hard-timed-out call is NEVER
+        // re-issued — classifyLLMError lumps AbortError / [HARD-TIMEOUT] into
+        // TRANSIENT, yet re-running a slow / already-timed-out call just burns
+        // the whole 10-min budget again. The re-issue reuses the same call()
+        // closure and its existing timeoutSignal(LLM_CALL_TIMEOUT_MS)/hardTimeout
+        // chain — no fresh budget.
+        // Our own round-trip deadline is armed only while a next chain entry
+        // can take the call, so it always goes there, whatever the kill
+        // switch says: re-issuing would arm a fresh deadline on the route
+        // that just stalled and double the wait before the cascade.
+        if (failureChain(err).some(isProviderDeadlineError)) {
+            throw err;
+        }
+        if (providerTimeoutCascadeEnabled()) {
+            if (isCallerAbortOrBudget(err)) {
+                throw err;
+            }
+            // A provider timeout with a next chain entry goes to that entry:
+            // re-issuing on the route that just stalled only delays the cascade.
+            if (hasNextModel && isProviderTimeout(err)) {
+                throw err;
+            }
+        }
+        // Today's rule for everything else, kept as is: with no next entry a
+        // JSON-bodied 504 still gets its one re-issue, while an empty/HTML 504
+        // (message "Gateway Timeout") still does not.
         if (isAbortOrHardTimeout(err)) {
             throw err;
         }

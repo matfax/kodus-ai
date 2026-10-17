@@ -26,6 +26,13 @@ export interface AgentSpec {
     readonly spanName?: string;
     /** Tools this role may use. */
     readonly tools: ToolRegistry;
+    /** The same tools as built for one model, when a tool's shape depends on it
+     *  (a done-tool that is strict only on strict-capable models). The model
+     *  call can fail over to another model before the first step, and each
+     *  attempt gets the tools for its own model id (undefined for the managed
+     *  default). Must list the same tool names as `tools`. Unset → `tools`
+     *  for every attempt. */
+    readonly toolsForModel?: (modelId: string | undefined) => ToolRegistry;
     /** Composable policies (budget, progress, compression, verify...). */
     readonly policies: readonly AgentPolicy[];
     /** Hard ceiling — the runner's fail-open even if no policy stops. */

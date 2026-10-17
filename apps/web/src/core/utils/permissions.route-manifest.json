@@ -136,6 +136,14 @@
     }
   },
   {
+    "route": "/organization/model-fallbacks",
+    "expected": {
+      "billing_manager": "deny",
+      "repo_admin": "deny",
+      "contributor": "deny"
+    }
+  },
+  {
     "route": "/organization/notifications",
     "expected": {
       "billing_manager": "deny",

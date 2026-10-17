@@ -17,8 +17,9 @@ const { fridayKeys, tier0Signal, FEW_CASES } = require('./tier0-smoke');
 type Stage = { id: string; name: string; group: string; eval: string | null; model: string; wiring: string[]; pipeline: string[] | null; nightly?: string; friday?: string; byHand?: string[] };
 type Row = { name: string; status: string; value: number | null; meta: Record<string, unknown> };
 
-// Steps of evals/wiring-smoke.js that check the harness, not a review stage.
-const NOT_A_STAGE = ['preflight'];
+// Steps of evals/wiring-smoke.js that check the harness, not a review stage,
+// each with the eval folder it runs (null: no eval of its own).
+const NOT_A_STAGE: Record<string, string | null> = { preflight: null, failover: 'evals/failover' };
 
 const wiringSteps = Array.from(
     fs.readFileSync(path.join(__dirname, 'wiring-smoke.js'), 'utf8').matchAll(/\bname: '([a-z-]+)'/g),
@@ -57,8 +58,20 @@ describe('evals/stages.js', () => {
     it('claims every wiring smoke step, and names only steps that exist', () => {
         const claimed = STAGES.flatMap((s: Stage) => s.wiring);
         expect(wiringSteps.length).toBeGreaterThan(5);
-        expect(wiringSteps.filter((step) => !claimed.includes(step) && !NOT_A_STAGE.includes(step))).toEqual([]);
+        expect(wiringSteps.filter((step) => !claimed.includes(step) && !(step in NOT_A_STAGE))).toEqual([]);
         expect(claimed.filter((step: string) => !wiringSteps.includes(step))).toEqual([]);
+        expect(Object.keys(NOT_A_STAGE).filter((step) => !wiringSteps.includes(step) || claimed.includes(step))).toEqual([]);
+    });
+
+    // A harness check is not on the panel, but its cases still say what they check.
+    it('gives every harness check with an eval of its own a catalog of its cases', () => {
+        const evals = Object.values(NOT_A_STAGE).filter((dir): dir is string => dir !== null);
+        expect(evals.length).toBeGreaterThan(0);
+        for (const dir of evals) {
+            const file = path.join(dir, 'catalog.js');
+            expect([dir, fs.existsSync(path.join(__dirname, '..', file))]).toEqual([dir, true]);
+            expect([dir, catalogProblems(loadCatalog(file))]).toEqual([dir, []]);
+        }
     });
 
     // Adding a pipeline stage means saying how it is tested: a stage here, or plumbing.

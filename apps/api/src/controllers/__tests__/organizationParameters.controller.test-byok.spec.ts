@@ -39,6 +39,7 @@ describe('OrganizationParametersController.testByokConnection — body passthrou
             undefined as any, // ignoreBotsUseCase
             undefined as any, // updateAutoLicenseAllowedUsersUseCase
             {} as any, // request
+            undefined as any, // setByokFallbackChainUseCase
         );
     });
 

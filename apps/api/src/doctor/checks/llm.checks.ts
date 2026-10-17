@@ -35,9 +35,9 @@ export const liveLlmComplete: LlmDeps['complete'] = async ({
     timeoutMs,
 }) => {
     await LLM.run({
-        // Strip the runtime fallback so a broken primary is reported, not
-        // silently covered by the fallback model.
-        byokConfig: slot ? { ...slot, fallback: undefined } : undefined,
+        // Strip the runtime fallback chain so a broken primary is reported, not
+        // silently covered by a fallback model.
+        byokConfig: slot ? { ...slot, fallbacks: undefined } : undefined,
         user: 'Reply with the single word OK.',
         runName: 'selfhosted-doctor',
         organizationId,

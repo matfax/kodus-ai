@@ -2,12 +2,25 @@ import {
     LlmErrorCategory,
     attachClassification,
     classifyLLMError,
+    failureChain,
     getClassification,
+    isAbortOrHardTimeout,
+    isCallerAbortOrBudget,
+    isProviderTimeout,
     isTerminalCategory,
     llmErrorLogLevel,
 } from './error-classifier';
 import { APICallError } from '@ai-sdk/provider';
 import { RetryError } from 'ai';
+import { ProviderDeadlineError } from './provider-deadline-error';
+import {
+    HTML_504_BODY,
+    afterSdkRetries,
+    httpProviderError,
+    jsonErrorBody,
+    networkProviderError,
+    undiciError,
+} from './testing/provider-errors';
 
 import {
     AgentContextWindowTooSmallError,
@@ -641,5 +654,318 @@ describe('attachClassification / getClassification', () => {
         });
         expect(serialized).not.toContain('AUTH_INVALID');
         expect(serialized).not.toContain('reviewErrorClassification');
+    });
+});
+
+describe('the timeout gate: provider timeout vs caller abort', () => {
+    // Real SDK errors (see testing/provider-errors.ts). The prose gate read the
+    // SDK's "Gateway Timeout" status phrase as a cancel, so a 504 never reached
+    // the org's fallback; these pin the split on the fields the errors carry.
+    const queueTimeout = () =>
+        new Error(
+            '[BYOK-QUEUE-TIMEOUT] review waited more than 60s for an LLM concurrency slot',
+        );
+    const abortError = () =>
+        Object.assign(new Error('This operation was aborted'), {
+            name: 'AbortError',
+        });
+    const deadline = () =>
+        new ProviderDeadlineError({
+            deadlineMs: 90_000,
+            source: 'round-trip',
+            phase: 'round-trip',
+            provider: 'openai',
+            model: 'gpt-x',
+        });
+    const undiciTimeout = (name: string, message: string, code: string) => () =>
+        networkProviderError(undiciError(name, message, code));
+
+    describe('isProviderTimeout', () => {
+        it.each([
+            [
+                'an empty-bodied 504',
+                () => httpProviderError(504, 'Gateway Timeout'),
+            ],
+            [
+                'an HTML 504',
+                () => httpProviderError(504, 'Gateway Timeout', HTML_504_BODY),
+            ],
+            [
+                'a JSON 504',
+                () =>
+                    httpProviderError(
+                        504,
+                        'Gateway Timeout',
+                        jsonErrorBody('The request timed out.'),
+                    ),
+            ],
+            ['a 408', () => httpProviderError(408, 'Request Timeout')],
+            ['a Cloudflare 524', () => httpProviderError(524, '')],
+            [
+                'an undici connect timeout',
+                undiciTimeout(
+                    'ConnectTimeoutError',
+                    'Connect Timeout Error',
+                    'UND_ERR_CONNECT_TIMEOUT',
+                ),
+            ],
+            [
+                'an undici headers timeout',
+                undiciTimeout(
+                    'HeadersTimeoutError',
+                    'Headers Timeout Error',
+                    'UND_ERR_HEADERS_TIMEOUT',
+                ),
+            ],
+            [
+                'an undici body timeout',
+                undiciTimeout(
+                    'BodyTimeoutError',
+                    'Body Timeout Error',
+                    'UND_ERR_BODY_TIMEOUT',
+                ),
+            ],
+            [
+                'a socket ETIMEDOUT',
+                undiciTimeout(
+                    'Error',
+                    'connect ETIMEDOUT 10.0.0.1:443',
+                    'ETIMEDOUT',
+                ),
+            ],
+            [
+                'a 504 after the SDK spent its retries',
+                async () =>
+                    afterSdkRetries([
+                        await httpProviderError(504, 'Gateway Timeout'),
+                        await httpProviderError(504, 'Gateway Timeout'),
+                        await httpProviderError(504, 'Gateway Timeout'),
+                    ]),
+            ],
+            [
+                'a ProviderDeadlineError after a retried 503',
+                async () =>
+                    afterSdkRetries(
+                        [
+                            await httpProviderError(503, 'Service Unavailable'),
+                            deadline(),
+                        ],
+                        2,
+                    ),
+            ],
+            ['a bare ProviderDeadlineError', async () => deadline()],
+        ])('is true for %s', async (_label, make) => {
+            const err = await make();
+            expect(isProviderTimeout(err)).toBe(true);
+            expect(isCallerAbortOrBudget(err)).toBe(false);
+        });
+
+        it('the empty and HTML 504s carry only the status phrase (the bug)', async () => {
+            // Why the prose gate missed them: this message is all there is.
+            for (const body of ['', HTML_504_BODY]) {
+                const err = (await httpProviderError(
+                    504,
+                    'Gateway Timeout',
+                    body,
+                )) as Error;
+                expect(APICallError.isInstance(err)).toBe(true);
+                expect(err.message).toBe('Gateway Timeout');
+                expect(isAbortOrHardTimeout(err)).toBe(true);
+                expect(classifyLLMError(err).category).toBe(
+                    LlmErrorCategory.TRANSIENT,
+                );
+            }
+        });
+
+        it('sees the undici timeout the SDK wrapped as "Cannot connect to API"', async () => {
+            const err = (await undiciTimeout(
+                'ConnectTimeoutError',
+                'Connect Timeout Error',
+                'UND_ERR_CONNECT_TIMEOUT',
+            )()) as Error;
+            expect(err.message).toBe(
+                'Cannot connect to API: Connect Timeout Error',
+            );
+            expect(isProviderTimeout(err)).toBe(true);
+        });
+
+        it.each([
+            ['a 503', () => httpProviderError(503, 'Service Unavailable')],
+            ['a 500', () => httpProviderError(500, 'Internal Server Error')],
+            ['a 429', () => httpProviderError(429, 'Too Many Requests')],
+            [
+                'a 400 that mentions a timeout in its body',
+                () =>
+                    httpProviderError(
+                        400,
+                        'Bad Request',
+                        jsonErrorBody('timeout must be <= 600'),
+                    ),
+            ],
+            [
+                'a closed socket',
+                undiciTimeout(
+                    'SocketError',
+                    'other side closed',
+                    'UND_ERR_SOCKET',
+                ),
+            ],
+            ['an AbortError', async () => abortError()],
+            ['a plain Error', async () => new Error('boom')],
+            ['undefined', async () => undefined],
+        ])('is false for %s', async (_label, make) => {
+            expect(isProviderTimeout(await make())).toBe(false);
+        });
+    });
+
+    describe('isCallerAbortOrBudget', () => {
+        it.each([
+            ['an AbortError', async () => abortError()],
+            [
+                'a DOMException AbortError',
+                async () =>
+                    new DOMException(
+                        'This operation was aborted',
+                        'AbortError',
+                    ),
+            ],
+            [
+                'a DOMException TimeoutError (AbortSignal.timeout)',
+                async () =>
+                    new DOMException(
+                        'The operation was aborted due to timeout',
+                        'TimeoutError',
+                    ),
+            ],
+            [
+                'a Next.js ResponseAborted',
+                async () =>
+                    Object.assign(new Error('response aborted'), {
+                        name: 'ResponseAborted',
+                    }),
+            ],
+            [
+                'the [HARD-TIMEOUT] race',
+                async () => new Error('[HARD-TIMEOUT] review exceeded 600s'),
+            ],
+            ['a [BYOK-QUEUE-TIMEOUT]', async () => queueTimeout()],
+            [
+                'a [BYOK-QUEUE-ABORTED]',
+                async () =>
+                    new Error(
+                        '[BYOK-QUEUE-ABORTED] review was cancelled before acquiring an LLM concurrency slot',
+                    ),
+            ],
+            [
+                'a [BYOK-QUEUE-TIMEOUT] after a retried 504',
+                async () =>
+                    afterSdkRetries(
+                        [
+                            await httpProviderError(504, 'Gateway Timeout'),
+                            queueTimeout(),
+                        ],
+                        2,
+                    ),
+            ],
+            [
+                'an AbortError wrapped in an exhausted RetryError',
+                async () =>
+                    new RetryError({
+                        message:
+                            'Failed after 2 attempts. Last error: This operation was aborted',
+                        reason: 'maxRetriesExceeded',
+                        errors: [
+                            await httpProviderError(504, 'Gateway Timeout'),
+                            abortError(),
+                        ],
+                    }),
+            ],
+            [
+                'a cancel whose cause is a provider timeout',
+                async () =>
+                    Object.assign(abortError(), {
+                        cause: await httpProviderError(504, 'Gateway Timeout'),
+                    }),
+            ],
+            [
+                'a marker passed as a string',
+                async () => '[HARD-TIMEOUT] x exceeded 90s',
+            ],
+        ])('is true for %s', async (_label, make) => {
+            expect(isCallerAbortOrBudget(await make())).toBe(true);
+        });
+
+        it.each([
+            [
+                'an empty-bodied 504',
+                () => httpProviderError(504, 'Gateway Timeout'),
+            ],
+            ['a 408', () => httpProviderError(408, 'Request Timeout')],
+            [
+                'a Vertex "timed out" message',
+                () =>
+                    httpProviderError(
+                        504,
+                        'Gateway Timeout',
+                        jsonErrorBody('The request timed out.'),
+                    ),
+            ],
+            [
+                'a 500 whose text merely says "aborted"',
+                () =>
+                    httpProviderError(
+                        500,
+                        'Internal Server Error',
+                        jsonErrorBody('upstream request aborted'),
+                    ),
+            ],
+            ['a bare ProviderDeadlineError', async () => deadline()],
+            ['undefined', async () => undefined],
+        ])('is false for %s', async (_label, make) => {
+            expect(isCallerAbortOrBudget(await make())).toBe(false);
+        });
+    });
+
+    describe('failureChain', () => {
+        it('walks lastError, errors.at(-1) and cause, outermost first', async () => {
+            const inner = (await undiciTimeout(
+                'HeadersTimeoutError',
+                'Headers Timeout Error',
+                'UND_ERR_HEADERS_TIMEOUT',
+            )()) as Error;
+            const retry = await afterSdkRetries([inner, inner]);
+            const chain = failureChain(retry);
+            expect(chain[0]).toBe(retry);
+            expect(chain[1]).toBe(inner);
+            expect(chain[2]).toBe(inner.cause);
+        });
+
+        it('stops on a cycle and at the depth cap', () => {
+            const a: any = new Error('a');
+            const b: any = new Error('b');
+            a.cause = b;
+            b.cause = a;
+            expect(failureChain(a)).toEqual([a, b]);
+
+            let deep: any = new Error('0');
+            for (let i = 1; i < 10; i++) {
+                deep = Object.assign(new Error(String(i)), { cause: deep });
+            }
+            expect(failureChain(deep)).toHaveLength(4);
+        });
+    });
+
+    it('classifies a ProviderDeadlineError as TRANSIENT, bare or inside a RetryError', async () => {
+        expect(classifyLLMError(deadline()).category).toBe(
+            LlmErrorCategory.TRANSIENT,
+        );
+        const wrapped = await afterSdkRetries(
+            [await httpProviderError(503, 'Service Unavailable'), deadline()],
+            2,
+        );
+        expect((wrapped as RetryError).reason).toBe('errorNotRetryable');
+        expect(classifyLLMError(wrapped).category).toBe(
+            LlmErrorCategory.TRANSIENT,
+        );
     });
 });

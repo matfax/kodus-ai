@@ -13,6 +13,7 @@ import { IOrganizationParameters } from '@libs/organization/domain/organizationP
 import { OrganizationParametersKey } from '@libs/core/domain/enums/organization-parameters-key.enum';
 import { OrganizationAndTeamData } from '@libs/core/infrastructure/config/types/general/organizationAndTeamData';
 import { BYOKConfig, isByokConfig } from '@libs/llm/byok-config';
+import { removeFromFallbackTail } from '@libs/llm/byok-fallback-chain';
 
 @Injectable()
 export class OrganizationParametersService implements IOrganizationParametersService {
@@ -231,10 +232,22 @@ export class OrganizationParametersService implements IOrganizationParametersSer
                 (c) => c?.managed || (c?.id && stillReferenced.has(c.id)),
             );
 
+            // A fallback-chain TAIL entry is pruned with its model: no UI shows
+            // the tail, so the reference guard lets the delete through rather
+            // than ask the user to clear something they cannot see. The head is
+            // a guarded reference and never reaches here.
             const newConfigValue: BYOKConfig = {
                 ...configValue,
                 models: remainingModels,
                 credentials: remainingCredentials,
+                ...(configValue.routing
+                    ? {
+                          routing: removeFromFallbackTail(
+                              configValue.routing,
+                              modelId,
+                          ),
+                      }
+                    : {}),
             };
 
             const updatedConfig =

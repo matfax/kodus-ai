@@ -108,7 +108,7 @@ export function slotForProbe(slot: NormalizedModel): NormalizedModel {
         tpm: _tpm,
         cooldownMs: _cooldownMs,
         maxConcurrentRequests: _maxConcurrentRequests,
-        fallback: _fallback,
+        fallbacks: _fallbacks,
         ...inferenceShape
     } = slot;
     return inferenceShape as NormalizedModel;

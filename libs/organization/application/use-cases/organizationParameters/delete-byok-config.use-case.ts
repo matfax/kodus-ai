@@ -170,7 +170,9 @@ export class DeleteByokConfigUseCase {
         // (defaultModelId / fallbackModelId / taskOverrides[*]) OR any repo/folder
         // override points at this model — deleting it would orphan that reference
         // (RESEARCH Security "Orphaned routing ref via delete"). Skipped on the
-        // last-model disconnect above, where orphaning is impossible.
+        // last-model disconnect above, where orphaning is impossible. A
+        // fallback-chain TAIL entry is not a blocking ref: the service prunes it
+        // with the model, since no UI shows the tail for the user to clear.
         if (!isLastModel) {
             const routingRefs = findModelReferences(config, modelId);
 

@@ -808,8 +808,9 @@ describe('backfill D — input variants (single-candidate boundary)', () => {
 });
 
 // ---- E. Provider / model matrix (the "N modelos") ------------------------
-// The verifier's structured-output gate is `supportsStrictToolsForRun`, baked
-// into the spec's submitVerdict tool as `strict`. For THIS boundary only Gemini
+// The verifier's structured-output gate is `supportsStrictTools`, baked into
+// the spec's submitVerdict tool as `strict` (and rebuilt per failover attempt
+// through the spec's `toolsForModel`). For THIS boundary only Gemini
 // gets strict json_schema (see model-strictness.ts); every other model —
 // including the matrix's kimi/glm/deepseek/z-ai json_object fallbacks AND
 // openai/anthropic here — runs WITHOUT strict, so the full A/B/C off-schema zoo
@@ -818,10 +819,9 @@ describe('backfill D — input variants (single-candidate boundary)', () => {
 // zoo assertions above already hold for every branch. These tests pin the gate
 // itself and that model-independence.
 describe('backfill E — N-model structured-output gate', () => {
-    const strictOf = (modelId: string, fallbackModelId?: string) =>
+    const strictOf = (modelId: string) =>
         buildVerifierAgentSpec({
             modelId,
-            fallbackModelId,
             tools: new InMemoryToolRegistry([]),
         })
             .tools.list()
@@ -842,10 +842,21 @@ describe('backfill E — N-model structured-output gate', () => {
         }
     });
 
-    it('failover: a Gemini primary with a non-strict fallback loses strict (safe swap)', () => {
-        expect(strictOf('gemini-2.5-pro', 'openai/gpt-4o')).toBe(false);
-        // both strict-capable → stays strict
-        expect(strictOf('gemini-2.5-pro', 'gemini-1.5-flash')).toBe(true);
+    it('failover: each attempt gets the done-tool for its own model', () => {
+        const spec = buildVerifierAgentSpec({
+            modelId: 'gemini-2.5-pro',
+            tools: new InMemoryToolRegistry([]),
+        });
+        const strictFor = (modelId: string | undefined) =>
+            spec
+                .toolsForModel?.(modelId)
+                .list()
+                .find((t) => t.name === VERIFY_DONE_TOOL)?.strict;
+        // the Gemini primary keeps strict; a non-strict fallback does not get it
+        expect(strictFor('gemini-2.5-pro')).toBe(true);
+        expect(strictFor('openai/gpt-4o')).toBe(false);
+        expect(strictFor('gemini-1.5-flash')).toBe(true);
+        expect(strictFor(undefined)).toBe(false);
     });
 
     it('pins the two matrix policy branches at the shared gate (json_schema vs json_object)', () => {

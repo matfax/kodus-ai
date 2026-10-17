@@ -108,6 +108,9 @@ async function main() {
     // that exits 0 without calling it proves nothing about the engine path.
     const steps = [
         { name: 'preflight', args: ['evals/engine-gate.js', '--profile=harness'] },
+        // The fallback chain behind every LLM.run: the primary is a second fake
+        // server answering with faults, the fallback this one.
+        { name: 'failover', model: true, args: ['evals/failover/run.js', '--gate', `--output=${path.join(scratch, 'failover.json')}`] },
         // Replays recorded model output; only prose recovery reaches the model.
         { name: 'parse', model: true, args: ['evals/parse/run.js', '--model=eval-fake', '--gate'] },
         { name: 'review-chain', args: ['evals/review-chain/run.js', '--gate'] },

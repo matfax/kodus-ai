@@ -21,6 +21,7 @@ import {
     TestByokModelUseCase,
     ListModelOverridesUseCase,
     ClearModelOverridesUseCase,
+    SetByokFallbackChainUseCase,
 } from '../application/use-cases/organizationParameters';
 import { PlatformModule } from '@libs/platform/modules/platform.module';
 import { CodebaseModule } from '@libs/code-review/modules/codebase.module';
@@ -68,6 +69,7 @@ import {
         TestByokModelUseCase,
         ListModelOverridesUseCase,
         ClearModelOverridesUseCase,
+        SetByokFallbackChainUseCase,
     ],
     exports: [
         ORGANIZATION_PARAMETERS_SERVICE_TOKEN,
@@ -85,6 +87,7 @@ import {
         TestByokModelUseCase,
         ListModelOverridesUseCase,
         ClearModelOverridesUseCase,
+        SetByokFallbackChainUseCase,
         ProviderModule, // Added
     ],
 })

@@ -137,18 +137,14 @@ export async function runAgentLoopViaCore(
     // slot — the same id `buildModelFromSlot` would have stamped on the built
     // model. Undefined (managed/env default → no slot) degrades to 'resolved',
     // which disables strict — parity with before, since the managed default
-    // isn't a strict-capable (Gemini) model.
+    // isn't a strict-capable (Gemini) model. A failover onto a chain entry
+    // needs nothing here: the finder and verifier specs rebuild their tools
+    // for each attempt's model (AgentSpec.toolsForModel).
     const specModelId = secrets.byokConfig?.model ?? 'resolved';
-    // The runtime failover target (if the slot has one). Strict tool use must
-    // account for it: LLM.run can swap primary → fallback mid-call, and a strict
-    // tool built for the primary would be rejected by a non-strict fallback
-    // (e.g. Gemini primary → OpenAI fallback). See supportsStrictToolsForRun.
-    const fallbackModelId = secrets.byokConfig?.fallback?.model;
     const buildSpecWithLedger = (ledger: DiffCoverageLedger) =>
         buildFinderAgentSpec({
             systemPrompt: input.systemPrompt,
             modelId: specModelId,
-            fallbackModelId,
             usageRunName: input.usageRunName,
             agentName: input.agentName,
             tools,
@@ -215,7 +211,6 @@ export async function runAgentLoopViaCore(
             finderSpec,
             makeResampleSpec,
             modelId: specModelId,
-            fallbackModelId,
             tools,
             providerOptions,
             skipHeavyPasses,

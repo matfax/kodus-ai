@@ -237,6 +237,70 @@ describe('DeleteByokConfigUseCase — referential-integrity guard (REQ-DELETE-01
         expect(deleteByokModel).toHaveBeenCalledWith(ORG, 'm2');
     });
 
+    it('lets a fallback-chain TAIL entry be deleted (the service prunes it)', async () => {
+        const { useCase, deleteByokModel } = buildUseCase({
+            byokConfig: makeByokConfig({
+                models: [
+                    { id: 'm1', credentialId: 'cred-openai', model: 'gpt-5' },
+                    {
+                        id: 'm2',
+                        credentialId: 'cred-anthropic',
+                        model: 'claude-opus-4-8',
+                    },
+                    {
+                        id: 'm3',
+                        credentialId: 'cred-openai',
+                        model: 'gpt-5-mini',
+                    },
+                ],
+                routing: {
+                    mode: 'manual',
+                    defaultModelId: 'm1',
+                    fallbackModelId: 'm2',
+                    fallbackModelIds: ['m2', 'm3'],
+                },
+            }),
+            codeReviewConfig: { configs: {}, repositories: [] },
+        });
+
+        await expect(useCase.execute(ORG, { modelId: 'm3' })).resolves.toBe(
+            true,
+        );
+        expect(deleteByokModel).toHaveBeenCalledWith(ORG, 'm3');
+    });
+
+    it('still refuses to delete the fallback-chain HEAD', async () => {
+        const { useCase, deleteByokModel } = buildUseCase({
+            byokConfig: makeByokConfig({
+                models: [
+                    { id: 'm1', credentialId: 'cred-openai', model: 'gpt-5' },
+                    {
+                        id: 'm2',
+                        credentialId: 'cred-anthropic',
+                        model: 'claude-opus-4-8',
+                    },
+                    {
+                        id: 'm3',
+                        credentialId: 'cred-openai',
+                        model: 'gpt-5-mini',
+                    },
+                ],
+                routing: {
+                    mode: 'manual',
+                    defaultModelId: 'm1',
+                    fallbackModelId: 'm2',
+                    fallbackModelIds: ['m2', 'm3'],
+                },
+            }),
+            codeReviewConfig: { configs: {}, repositories: [] },
+        });
+
+        await expect(useCase.execute(ORG, { modelId: 'm2' })).rejects.toThrow(
+            /your fallback model/,
+        );
+        expect(deleteByokModel).not.toHaveBeenCalled();
+    });
+
     it('rejects a model-level delete against a legacy config', async () => {
         const { useCase, deleteByokModel } = buildUseCase({
             byokConfig: { main: { provider: 'openai', apiKey: 'x' } },
@@ -364,6 +428,55 @@ describe('OrganizationParametersService.deleteByokModel — model removal', () =
         await expect(service.deleteByokModel(ORG, 'm1')).resolves.toBe(true);
         expect(del).toHaveBeenCalledWith('p1');
         expect(update).not.toHaveBeenCalled();
+    });
+
+    it('prunes the deleted model from the fallback-chain tail', async () => {
+        const { service, update } = buildService(
+            makeByokConfig({
+                models: [
+                    { id: 'm1', credentialId: 'cred-openai', model: 'gpt-5' },
+                    {
+                        id: 'm2',
+                        credentialId: 'cred-anthropic',
+                        model: 'claude-opus-4-8',
+                    },
+                    {
+                        id: 'm3',
+                        credentialId: 'cred-openai',
+                        model: 'gpt-5-mini',
+                    },
+                ],
+                routing: {
+                    mode: 'manual',
+                    defaultModelId: 'm1',
+                    fallbackModelId: 'm2',
+                    fallbackModelIds: ['m2', 'm3'],
+                },
+            }),
+        );
+
+        await service.deleteByokModel(ORG, 'm3');
+        const written = update.mock.calls[0][1].configValue as BYOKConfig;
+        expect(written.routing).toEqual({
+            mode: 'manual',
+            defaultModelId: 'm1',
+            fallbackModelId: 'm2',
+        });
+    });
+
+    it('leaves routing untouched when the deleted model is not in the chain', async () => {
+        const config = makeByokConfig({
+            routing: {
+                mode: 'manual',
+                defaultModelId: 'm1',
+                fallbackModelId: 'm1',
+            },
+        });
+        const { service, update } = buildService(config);
+
+        await service.deleteByokModel(ORG, 'm2');
+        const written = update.mock.calls[0][1].configValue as BYOKConfig;
+        expect(written.routing).toBe(config.routing);
     });
 
     it('throws when the model id does not exist', async () => {

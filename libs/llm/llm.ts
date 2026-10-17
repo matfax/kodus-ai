@@ -43,14 +43,20 @@ import {
     type AgentLoopSeams,
 } from '@libs/llm/agent-loop-call';
 import {
+    roundTripDeadlineFor,
     runWithModelFailover,
     type FailoverAttemptControl,
 } from '@libs/llm/model-failover';
+import type { ByokRoundTrip } from '@libs/llm/byok-model-wrapper';
+import { LLM_CALL_TIMEOUT_MS } from '@libs/llm/llm-call';
 
 /** The raw AI SDK result an agent-loop call returns (steps / usage / text). */
 export type AgentLoopResult = Awaited<ReturnType<typeof generateText>>;
 
-export interface LlmRequest extends Omit<BaseReviewCallParams, 'byokConfig' | 'user'> {
+export interface LlmRequest extends Omit<
+    BaseReviewCallParams,
+    'byokConfig' | 'user' | 'hasNextModel' | 'roundTrip'
+> {
     /** A pre-resolved slot — the caller already routed task → slot. */
     byokConfig?: NormalizedModel;
     /** OR route here: the org's stored BYOK config + the task. Pure routing. */
@@ -118,7 +124,7 @@ function resolveSlot(req: LlmRequest): NormalizedModel | undefined {
  */
 function toExecutorParams(
     req: LlmRequest,
-): Omit<BaseReviewCallParams, 'byokConfig'> {
+): Omit<BaseReviewCallParams, 'byokConfig' | 'hasNextModel' | 'roundTrip'> {
     const {
         config: _config,
         task: _task,
@@ -134,28 +140,95 @@ function toExecutorParams(
         // one-shot executor honors them as fixed-tuning overrides (demo paths).
         ...rest
     } = req;
-    return rest as Omit<BaseReviewCallParams, 'byokConfig'>;
+    return rest as Omit<
+        BaseReviewCallParams,
+        'byokConfig' | 'hasNextModel' | 'roundTrip'
+    >;
 }
 
 /**
- * Wrap the runner's loop seams so the FIRST emitted step vetoes failover for the
- * current attempt: a step's tool calls mutate shared runner state (its step array
- * + policy progress), so restarting on the fallback would double-count them. The
- * high-value cascade (a bad/expired key, an unknown model) fails BEFORE the first
- * step, so it still fires — this only holds back a rare mid-loop transient.
+ * The runner's loop seams as one attempt runs them.
+ *
+ * - Tools: `toolsForModel`, when the runner supplied it, builds this attempt's
+ *   tool map for its own model, so a chain entry gets tools it can accept.
+ * - Failover guard: the FIRST emitted step vetoes failover for the current
+ *   attempt. A step's tool calls mutate shared runner state (its step array +
+ *   policy progress), so restarting on the fallback would double-count them.
+ *   The high-value cascade (a bad/expired key, an unknown model) fails BEFORE
+ *   the first step, so it still fires — this only holds back a rare mid-loop
+ *   transient.
  */
-function loopWithFailoverGuard(
+function loopForAttempt(
     loop: AgentLoopSeams,
+    attemptSlot: NormalizedModel | undefined,
     control: FailoverAttemptControl,
 ): AgentLoopSeams {
+    const { toolsForModel, ...seams } = loop;
     const inner = loop.onStepFinish;
     return {
-        ...loop,
+        ...seams,
+        tools: toolsForModel ? toolsForModel(attemptSlot?.model) : loop.tools,
         onStepFinish: (event: unknown) => {
             control.markUnsafeToRetry();
             return inner?.(event);
         },
     };
+}
+
+/**
+ * One attempt's round-trip deadline, handed to the BYOK wrapper.
+ *
+ * It exists only to buy a cascade, so it is active only while one is possible:
+ * a next chain entry exists and (loop mode) no step has run. The last entry,
+ * the only entry and every loop step after the first behave exactly as without
+ * it. A one-shot caller with a shorter `timeoutMs` than the knob gets that
+ * budget as its deadline (`caller-budget`): the call cascades at the budget
+ * instead of failing as a plain timeout, but the breaker does not count it.
+ *
+ * The answer hook reports to the breaker on every attempt, deadline or not.
+ */
+function roundTripFor(
+    slot: NormalizedModel | undefined,
+    control: FailoverAttemptControl,
+    callerBudgetMs?: number,
+): ByokRoundTrip {
+    const knob = roundTripDeadlineFor(slot);
+    const fromCaller =
+        knob !== undefined &&
+        callerBudgetMs !== undefined &&
+        callerBudgetMs < knob;
+    return {
+        ms: fromCaller ? callerBudgetMs : knob,
+        source: fromCaller ? 'caller-budget' : 'round-trip',
+        isActive: () => control.hasNext && !control.isUnsafe(),
+        onAnswered: () => control.onAnswered(),
+    };
+}
+
+/**
+ * The span attributes of one attempt: the caller's, plus where the attempt sits
+ * in the chain and why it got there. Added only when they say something (a
+ * fallback attempt, a breaker that is not CLOSED), so a call that ran on its
+ * primary records exactly the attributes it always did.
+ */
+function attemptAttrs(
+    attrs: Record<string, unknown> | undefined,
+    control: FailoverAttemptControl,
+): Record<string, unknown> | undefined {
+    const extra: Record<string, unknown> = {
+        // `usedFallback` is already on the span: a chain entry's slot carries
+        // it from routing.
+        ...(control.chainIndex > 0
+            ? {
+                  chainIndex: control.chainIndex,
+                  failoverReason: control.failoverReason,
+              }
+            : {}),
+        ...(control.circuitState && control.circuitState !== 'closed'
+            ? { circuitState: control.circuitState }
+            : {}),
+    };
+    return Object.keys(extra).length ? { ...(attrs ?? {}), ...extra } : attrs;
 }
 
 export class LLM {
@@ -176,11 +249,12 @@ export class LLM {
         req: LlmRequest & { schema?: z.ZodType | Schema },
     ): Promise<unknown> {
         // Resolve the routing decision ONCE. The primary slot carries its runtime
-        // fallback in `.fallback` (stamped by resolveTaskSlot), so the cascade is
-        // primary → fallback; a slot without a fallback (or the managed default,
-        // undefined) makes `runWithModelFailover` a single-attempt pass-through.
+        // fallback chain in `.fallbacks` (stamped by resolveTaskSlot), so the
+        // cascade is primary → fallbacks in order; a slot without fallbacks (or
+        // the managed default, undefined) makes `runWithModelFailover` a
+        // single-attempt pass-through.
         const slot = resolveSlot(req);
-        const attempts = [slot, slot?.fallback];
+        const attempts = [slot, ...(slot?.fallbacks ?? [])];
         const failoverOpts = {
             runName: req.runName,
             organizationId: req.organizationId,
@@ -198,10 +272,10 @@ export class LLM {
                         byokConfig: attemptSlot,
                         system: req.system,
                         messages: req.messages ?? [],
-                        loop: loopWithFailoverGuard(loop, control),
+                        loop: loopForAttempt(loop, attemptSlot, control),
                         runName: req.runName,
                         spanName: req.spanName,
-                        attrs: req.attrs,
+                        attrs: attemptAttrs(req.attrs, control),
                         organizationId: req.organizationId,
                         reporter: req.reporter,
                         queueTimeoutMs: req.queueTimeoutMs,
@@ -211,22 +285,35 @@ export class LLM {
                         signal: req.signal,
                         maxOutputTokens: req.maxOutputTokens,
                         temperature: req.temperature,
+                        roundTrip: roundTripFor(attemptSlot, control),
                     }),
-                failoverOpts,
+                // The loop's signal is the caller's budget: once it has aborted,
+                // no further chain entry is started on it. One-shot calls carry
+                // no caller signal (toExecutorParams drops it), so none is passed.
+                { ...failoverOpts, signal: req.signal },
             );
         }
 
         // Pull the schema out first so a text call can never carry a stray
         // `schema` prop into the text executor. One-shot calls are atomic, so they
         // never veto failover — a primary failure re-issues cleanly on the fallback.
+        // `hasNextModel` tells D-00c whether a provider timeout has somewhere
+        // to cascade, so it throws instead of re-issuing on the stalled route.
         const { schema, ...rest } = req;
         const baseParams = toExecutorParams(rest);
         return runWithModelFailover(
             attempts,
-            (attemptSlot) => {
+            (attemptSlot, control) => {
                 const params: BaseReviewCallParams = {
                     ...baseParams,
                     byokConfig: attemptSlot,
+                    attrs: attemptAttrs(baseParams.attrs, control),
+                    hasNextModel: control.hasNext,
+                    roundTrip: roundTripFor(
+                        attemptSlot,
+                        control,
+                        baseParams.timeoutMs ?? LLM_CALL_TIMEOUT_MS,
+                    ),
                 };
                 return schema
                     ? runStructuredReviewCall({ ...params, schema })

@@ -30,7 +30,7 @@ import {
     recoverFindingsFromProse,
 } from '@libs/code-review/infrastructure/agents/core/finder.agent';
 import { extractVerdict } from '@libs/code-review/infrastructure/agents/core/verifier.agent';
-import { supportsStrictToolsForRun } from '@libs/code-review/infrastructure/agents/core/model-strictness';
+import { supportsStrictTools } from '@libs/code-review/infrastructure/agents/core/model-strictness';
 import { LLM } from '@libs/llm/llm';
 
 const mockResolve = resolveModelConfig as jest.Mock;
@@ -1061,17 +1061,19 @@ describe('contract matrix — D. input variants (invariant + return-shape)', () 
 });
 
 describe('contract matrix — E. N-model policy (strict json_schema vs fallback)', () => {
-    // The adapter's model-policy seam is supportsStrictToolsForRun, derived from
-    // the resolved slot's model id (specModelId = byokConfig?.model ?? 'resolved')
-    // and its failover target. On the strict branch the done-tool is grammar-
-    // constrained so the model cannot emit off-schema; on the fallback branch the
-    // full A/B/C zoo is in scope and the parse layer above must not degrade.
+    // The adapter's model-policy seam is supportsStrictTools, derived from the
+    // resolved slot's model id (specModelId = byokConfig?.model ?? 'resolved').
+    // A failover attempt gets its own decision from the spec's toolsForModel
+    // (strict-tools-per-attempt.spec.ts). On the strict branch the done-tool is
+    // grammar-constrained so the model cannot emit off-schema; on the fallback
+    // branch the full A/B/C zoo is in scope and the parse layer above must not
+    // degrade.
 
     // Strict branch — Gemini activates VALIDATED strict tool use (the only family
     // this adapter enables; see model-strictness.ts).
     it('row E-strict — Gemini gets strict tool use (trusts clean D at the source)', () => {
-        expect(supportsStrictToolsForRun('gemini-2.5-pro')).toBe(true);
-        expect(supportsStrictToolsForRun('gemini-3.1-pro')).toBe(true);
+        expect(supportsStrictTools('gemini-2.5-pro')).toBe(true);
+        expect(supportsStrictTools('gemini-3.1-pro')).toBe(true);
     });
 
     // json_object fallback branch — every other provider (incl. the gate's
@@ -1088,19 +1090,8 @@ describe('contract matrix — E. N-model policy (strict json_schema vs fallback)
             'z-ai/glm-4.6',
             'resolved',
         ]) {
-            expect(supportsStrictToolsForRun(id)).toBe(false);
+            expect(supportsStrictTools(id)).toBe(false);
         }
-    });
-
-    // Failover swap: strict is dropped if the fallback target can't honor it
-    // (a strict tool built for Gemini would be rejected by an OpenAI fallback).
-    it('row E-failover — Gemini primary + OpenAI fallback disables strict', () => {
-        expect(
-            supportsStrictToolsForRun('gemini-2.5-pro', 'openai:gpt-4o'),
-        ).toBe(false);
-        expect(
-            supportsStrictToolsForRun('gemini-2.5-pro', 'gemini-3.1-pro'),
-        ).toBe(true);
     });
 
     // The parse layer is MODEL-INDEPENDENT: the same off-schema wrapper degrades

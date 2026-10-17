@@ -237,17 +237,16 @@ describe('ValidateConfigStage — v2 routing', () => {
 
         const result = await stage.execute(buildContext(undefined));
 
-        // Primary = the routed default; the org's fallback rides on `.fallback`
-        // (stamped by resolveTaskSlot) so LLM.run can cascade primary→fallback at
-        // runtime. The fallback slot is flagged usedFallback for the span.
+        // Primary = the routed default; the org's fallback chain rides on
+        // `.fallbacks` (stamped by resolveTaskSlot) so LLM.run can cascade
+        // primary→fallback at runtime. Each entry is flagged usedFallback for
+        // the span.
         expect(result.codeReviewConfig.byokConfig?.model).toBe('gpt-4o');
-        const fallback = (
-            result.codeReviewConfig.byokConfig as {
-                fallback?: { model?: string; usedFallback?: boolean };
-            }
-        )?.fallback;
-        expect(fallback?.model).toBe('gpt-5-mini');
-        expect(fallback?.usedFallback).toBe(true);
+        const fallbacks = result.codeReviewConfig.byokConfig?.fallbacks;
+        expect(fallbacks).toHaveLength(1);
+        expect(fallbacks?.[0]?.model).toBe('gpt-5-mini');
+        expect(fallbacks?.[0]?.usedFallback).toBe(true);
+        expect(fallbacks?.[0]?.chainIndex).toBe(0);
     });
 
     it('degrades to the env/managed default (byokConfig undefined) on a BLOCKED verdict', async () => {

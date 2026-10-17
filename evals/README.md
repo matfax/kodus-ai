@@ -40,6 +40,7 @@ Neither trigger is a hand-kept folder list. The wiring smoke records every repo 
 | [reply-addressing](reply-addressing/README.md) | Does Kody answer unmentioned replies meant for it, and stay out of the rest? | nightly (gated) · PR (scripted model) · Friday (every tier-0 model, a few cases) |
 | [review-rounds](review-rounds/README.md) | Across rounds and sandbox failures, does what reaches the PR match a correct review? | nightly (gated) · PR (scripted model) · Friday (every tier-0 model, a few cases) |
 | [review-chain](review-chain/README.md) | Is every LLM call in the review chain wired to the shared output recovery? | PR |
+| [failover](failover/README.md) | When an org's primary model fails, stalls or is rate-limited, does the call move to the next model in its fallback chain, and only when it should? | PR (two local fake servers) |
 | [dedup](dedup/README.md) · [severity](severity/README.md) · [format](format/README.md) | Do the secondary passes keep real findings? | PR (mocked model) |
 | [promotion](promotion/README.md) | On frozen evidence, does the verifier keep or drop a candidate correctly? | on demand |
 | [verifier-verdict](verifier-verdict/README.md) | Does a verdict the verifier delivered reach the gate, and can it deliver one at all? | PR |

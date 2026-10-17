@@ -21,6 +21,9 @@ export const ORGANIZATION_PARAMETERS_PATHS = {
         "/organization-parameters/llm-config/status",
     ),
     GET_BYOK_PROVIDERS: pathToApiUrl("/organization-parameters/byok/providers"),
+    SET_BYOK_FALLBACK_CHAIN: pathToApiUrl(
+        "/organization-parameters/byok-fallback-chain",
+    ),
     GET_COCKPIT_METRICS_VISIBILITY: pathToApiUrl(
         "/organization-parameters/cockpit-metrics-visibility",
     ),

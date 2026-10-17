@@ -4,7 +4,7 @@
  * Resolves an LlmTask to a v2 `models[]` id by precedence:
  *
  *     folder/repo override  >  routing.taskOverrides[task]  >  routing.defaultModelId
- *                                                            ↳ (on gate failure) routing.fallbackModelId
+ *                                                            ↳ (on gate failure) the fallback chain, in order
  *
  * A candidate is eligible only when its provider's Phase-3 capabilities satisfy
  * the task (TASK_CAPABILITY_REQUIREMENTS). An ineligible / managed / unknown /
@@ -23,6 +23,7 @@
 import { REGISTRY } from './providers';
 import type { ModelCapabilities } from './providers/kernel/types';
 import { TASK_ROUTING_FALLBACK } from './byok-config';
+import { fallbackChainOf } from './byok-fallback-chain';
 import type {
     BYOKConfig,
     BYOKCredential,
@@ -87,8 +88,24 @@ interface Candidate {
     tier: string;
     /** W1: a legacy NAME override to apply onto this slot's `.model` (id-THEN-name). */
     nameOverride?: string;
-    /** Marks the fallback tier so the reason reads "fallback". */
+    /** Marks a fallback-chain tier so the reason reads "fallback". */
     isFallback?: boolean;
+    /** Position in the org's fallback chain (0 = `fallbackModelId`). */
+    chainIndex?: number;
+}
+
+/** One eligible fallback-chain entry, in chain order. */
+export interface FallbackVerdict extends RoutingVerdict {
+    modelId: string;
+    /** Position in the org's fallback chain (0 = `fallbackModelId`). */
+    chainIndex: number;
+}
+
+/** The runtime fallback entries that passed the gate, plus why the others
+ *  did not (debug trace only; ids and model names, never key material). */
+export interface FallbackResolution {
+    fallbacks: FallbackVerdict[];
+    skips: string[];
 }
 
 /**
@@ -112,7 +129,7 @@ export class StaticTaskStrategy implements RoutingStrategy {
         const { byId, creds, routing } = this.buildMaps(config);
 
         const primary = this.buildPrimaryCandidates(task, ctx, routing, byId);
-        const fallback = this.buildFallbackCandidate(routing, byId);
+        const fallbacks = this.buildFallbackCandidates(routing, byId);
         const requirement = TASK_CAPABILITY_REQUIREMENTS[task];
 
         const skips: string[] = [];
@@ -123,7 +140,7 @@ export class StaticTaskStrategy implements RoutingStrategy {
         // name-override variant stays distinct from the plain model (different
         // effective model name).
         const seen = new Set<string>();
-        for (const candidate of [...primary, ...fallback]) {
+        for (const candidate of [...primary, ...fallbacks]) {
             const key = `${candidate.model.id}::${candidate.nameOverride ?? ''}`;
             if (seen.has(key)) {
                 continue;
@@ -155,7 +172,7 @@ export class StaticTaskStrategy implements RoutingStrategy {
     }
 
     /** The lookup maps every resolution reads: models by id, credentials by id,
-     *  and the routing block. Shared by `resolve` (gate-time) and `resolveFallback`
+     *  and the routing block. Shared by `resolve` (gate-time) and `resolveFallbacks`
      *  (runtime failover) so the two never drift on how a config is projected. */
     private buildMaps(config: BYOKConfig): {
         byId: Map<string, BYOKModelConfig>;
@@ -176,30 +193,49 @@ export class StaticTaskStrategy implements RoutingStrategy {
     }
 
     /**
-     * Resolve ONLY the runtime failover candidate — the org's configured
-     * `routing.fallbackModelId` — through the SAME capability/credential gate as
-     * `resolve`. Returns its verdict when eligible, else `undefined` (no fallback
-     * configured, or it fails the gate: a fallback that can't run is not offered).
+     * Resolve the runtime failover chain — the org's configured fallback models,
+     * in order — each through the SAME capability/credential gate as `resolve`.
+     * An entry that fails the gate is not offered (a fallback that can't run is
+     * no fallback); its reason lands in `skips`.
      *
-     * Distinct from `resolve`, which folds the fallback in as the LAST gate-time
-     * tier (used when the primaries can't even be attempted). This one answers a
-     * different question — "if the primary that WON runs but fails at call time,
-     * what's the one model to try instead?" — and `resolveTaskSlot` stamps it onto
-     * `slot.fallback` so `LLM.run` can cascade at runtime. Pure; never throws.
+     * Distinct from `resolve`, which folds the chain in as the LAST gate-time
+     * tiers (used when the primaries can't even be attempted). This one answers a
+     * different question — "if the model that WON runs but fails at call time,
+     * which models are tried next, in order?" — and `resolveTaskSlot` stamps the
+     * answer onto `slot.fallbacks` so `LLM.run` can cascade at runtime.
+     *
+     * `afterModelId`: when the gate already picked a chain entry, only the
+     * entries AFTER it are a runtime tail. Pure; never throws.
      */
-    resolveFallback(
+    resolveFallbacks(
         task: LlmTask,
         config: BYOKConfig,
-    ): RoutingVerdict | undefined {
+        afterModelId?: string,
+    ): FallbackResolution {
         const { byId, creds, routing } = this.buildMaps(config);
         const requirement = TASK_CAPABILITY_REQUIREMENTS[task];
-        for (const candidate of this.buildFallbackCandidate(routing, byId)) {
+        let candidates = this.buildFallbackCandidates(routing, byId);
+        if (afterModelId) {
+            const winner = candidates.findIndex(
+                (c) => c.model.id === afterModelId,
+            );
+            candidates = winner >= 0 ? candidates.slice(winner + 1) : [];
+        }
+        const fallbacks: FallbackVerdict[] = [];
+        const skips: string[] = [];
+        for (const candidate of candidates) {
             const outcome = this.evaluate(task, candidate, creds, requirement);
-            if (outcome.eligible && outcome.verdict) {
-                return outcome.verdict;
+            if (outcome.eligible && outcome.verdict?.modelId) {
+                fallbacks.push({
+                    ...outcome.verdict,
+                    modelId: outcome.verdict.modelId,
+                    chainIndex: candidate.chainIndex ?? 0,
+                });
+            } else {
+                skips.push(outcome.reason);
             }
         }
-        return undefined;
+        return { fallbacks, skips };
     }
 
     /** override (id-THEN-name) > taskOverride > default. */
@@ -266,22 +302,36 @@ export class StaticTaskStrategy implements RoutingStrategy {
         return candidates;
     }
 
-    // `fallbackModelId` serves in TWO places, both fed by this one candidate:
-    //   - GATE-TIME (here, folded in as the last tier of `resolve`): when the
-    //     primary tiers all fail the capability/credential gate BEFORE the call.
-    //   - RUNTIME (via `resolveFallback` → `slot.fallback`): when the primary that
-    //     WON runs but fails at call time in a way a different model can fix — then
-    //     `LLM.run`'s model-failover re-issues once on it (model-failover.ts).
-    private buildFallbackCandidate(
+    // The fallback chain serves in TWO places, both fed by these candidates:
+    //   - GATE-TIME (folded in as the last tiers of `resolve`): when the primary
+    //     tiers all fail the capability/credential gate BEFORE the call, the
+    //     first eligible chain entry runs instead.
+    //   - RUNTIME (via `resolveFallbacks` → `slot.fallbacks`): when the model
+    //     that WON runs but fails at call time in a way a different model can
+    //     fix — then `LLM.run`'s model-failover re-issues on the next entry
+    //     (model-failover.ts).
+    // The first entry keeps the tier name `fallback`, so a single-fallback
+    // org's trace reads exactly as before; later ones are `fallback[i]`.
+    private buildFallbackCandidates(
         routing: NonNullable<BYOKConfig['routing']>,
         byId: Map<string, BYOKModelConfig>,
     ): Candidate[] {
-        const fallbackModel = routing.fallbackModelId
-            ? byId.get(routing.fallbackModelId)
-            : undefined;
-        return fallbackModel
-            ? [{ model: fallbackModel, tier: 'fallback', isFallback: true }]
-            : [];
+        const candidates: Candidate[] = [];
+        fallbackChainOf(routing).forEach((id, chainIndex) => {
+            const model = byId.get(id);
+            if (model) {
+                candidates.push({
+                    model,
+                    tier:
+                        chainIndex === 0
+                            ? 'fallback'
+                            : `fallback[${chainIndex}]`,
+                    isFallback: true,
+                    chainIndex,
+                });
+            }
+        });
+        return candidates;
     }
 
     /** Run the capability gate for one candidate; return an eligible verdict or a
@@ -333,9 +383,9 @@ export class StaticTaskStrategy implements RoutingStrategy {
             };
         }
 
-        const reason = isFallback
-            ? `resolved "${task}" via fallback to "${model.id}"`
-            : `resolved "${task}" via ${tier} to "${model.id}"`;
+        // The chain head's tier is `fallback`, so its reason reads "via
+        // fallback" exactly as the single-fallback trace always did.
+        const reason = `resolved "${task}" via ${tier} to "${model.id}"`;
         return {
             eligible: true,
             reason,

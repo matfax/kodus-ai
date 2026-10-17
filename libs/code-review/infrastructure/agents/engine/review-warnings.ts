@@ -86,19 +86,21 @@ export interface ReviewWarning {
  * dataExecution.reviewWarnings) when an agent's BYOK main provider failed and
  * the review completed on the configured fallback. `contextWindowTokens` is 0
  * because it is a provider-health signal, not a context-window fidelity drop —
- * so per-agent duplicates fold to a single dashboard entry.
+ * so per-agent duplicates fold to a single dashboard entry. `skipped` says the
+ * main model was not even tried: its circuit breaker was open.
  */
 export function buildProviderFallbackWarning(params: {
     failedModel: string;
     usedModel: string;
     agentName?: string;
+    skipped?: boolean;
 }): ReviewWarning {
     return {
         kind: 'PROVIDER_FALLBACK',
         reason: 'provider_failover',
         contextWindowTokens: 0,
         modelName: params.usedModel,
-        detail: `main provider ${params.failedModel} failed; review ran on fallback ${params.usedModel}`,
+        detail: `main provider ${params.failedModel} ${params.skipped ? 'skipped (circuit open)' : 'failed'}; review ran on fallback ${params.usedModel}`,
         agentName: params.agentName,
     };
 }
@@ -109,7 +111,10 @@ export function buildProviderFallbackWarning(params: {
  */
 export function withFallbackWarnings(
     warnings: ReviewWarning[] | undefined,
-    failovers: Array<Pick<ModelFailoverEvent, 'failedModel' | 'usedModel'>>,
+    failovers: Array<
+        Pick<ModelFailoverEvent, 'failedModel' | 'usedModel'> &
+            Partial<Pick<ModelFailoverEvent, 'hops'>>
+    >,
 ): ReviewWarning[] | undefined {
     if (!failovers.length) {
         return warnings;
@@ -120,6 +125,7 @@ export function withFallbackWarnings(
             buildProviderFallbackWarning({
                 failedModel: f.failedModel,
                 usedModel: f.usedModel,
+                skipped: f.hops?.[0]?.outcome === 'skipped',
             }),
         ),
     ]);

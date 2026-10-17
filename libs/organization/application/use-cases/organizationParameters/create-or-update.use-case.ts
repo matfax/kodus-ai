@@ -6,6 +6,10 @@ import {
     type BYOKCredential,
 } from '@libs/llm/byok-config';
 import { validateByokConfigRefs } from '@libs/llm/validate-byok-config-refs';
+import {
+    mergeFallbackChainOnWrite,
+    platformFundedTailEntries,
+} from '@libs/llm/byok-fallback-chain';
 import { BYOKProvider } from '@libs/llm/model-providers';
 import { isPlatformFundedProvider } from '@libs/llm/platform-funded-provider';
 import { isProviderAvailableHere } from '@libs/core/infrastructure/services/providers/kodus-provider-availability';
@@ -148,23 +152,6 @@ export class CreateOrUpdateOrganizationParametersUseCase implements IUseCase {
         configValue: any,
         organizationAndTeamData: OrganizationAndTeamData,
     ): Promise<boolean> {
-        // Write-time referential integrity for the untyped config blob (RFC §13.8):
-        // the DTO is `configValue: any`, so this is the ONLY server-side schema
-        // gate. Reject a dangling model.credentialId / routing ref BEFORE persist
-        // (never silently drop). Legacy configs are a no-op pass.
-        if (isByokConfig(configValue)) {
-            const refCheck = validateByokConfigRefs(configValue);
-            if (!refCheck.valid) {
-                throw new BadRequestException({
-                    message:
-                        'Invalid BYOK configuration: unresolved model/routing references',
-                    errors: refCheck.errors,
-                });
-            }
-
-            this.assertParsableReasoningOverrides(configValue);
-        }
-
         const getConfigValue =
             await this.organizationParametersService.findByKey(
                 organizationParametersKey,
@@ -175,6 +162,33 @@ export class CreateOrUpdateOrganizationParametersUseCase implements IUseCase {
             BYOKConfig | undefined;
 
         if (isByokConfig(configValue)) {
+            // Merge BEFORE validating: the enterprise routing tab rebuilds
+            // `routing` without the fallback chain's tail, so the stored tail is
+            // carried over here, and the stored entries that went stale are
+            // pruned rather than rejected (the user cannot see them to fix them).
+            configValue = this.mergeFallbackChain(
+                configValue,
+                isByokConfig(existingConfig) ? existingConfig : undefined,
+                organizationAndTeamData,
+            );
+
+            // Write-time referential integrity for the untyped config blob (RFC
+            // §13.8): the DTO is `configValue: any`, so this is the ONLY
+            // server-side schema gate. Reject a dangling model.credentialId /
+            // routing ref BEFORE persist (never silently drop). Legacy configs
+            // are a no-op pass.
+            const refCheck = validateByokConfigRefs(configValue);
+            if (!refCheck.valid) {
+                throw new BadRequestException({
+                    message:
+                        'Invalid BYOK configuration: unresolved model/routing references',
+                    errors: refCheck.errors,
+                });
+            }
+
+            this.assertNoPlatformFundedFallbackTail(configValue);
+            this.assertParsableReasoningOverrides(configValue);
+
             // SSRF guard: a credential's baseURL is user-controlled and the
             // server makes outbound LLM calls to it at review time. The
             // test-connection probe validates it, but a save can set/change it
@@ -206,8 +220,9 @@ export class CreateOrUpdateOrganizationParametersUseCase implements IUseCase {
         );
 
         // The front-end fully drives the untyped config blob, so a write is the
-        // complete intended config — use it verbatim (04b-06: encrypt now rejects
-        // any non-v2 shape, so there is no legacy partial-save merge to preserve).
+        // complete intended config — used verbatim apart from the fallback-chain
+        // merge above (04b-06: encrypt now rejects any non-v2 shape, so there is
+        // no legacy partial-save merge to preserve).
         const mergedConfigValue = processedConfigValue;
 
         const result =
@@ -253,6 +268,61 @@ export class CreateOrUpdateOrganizationParametersUseCase implements IUseCase {
         }
 
         return !!result;
+    }
+
+    /**
+     * Carry the stored fallback chain across this write (see
+     * `mergeFallbackChainOnWrite`) and leave a server-side trail of every change
+     * to its tail: the enterprise audit log records only `fallbackModelId`, and
+     * no UI shows the tail, so this warn is where a changed or pruned tail is
+     * visible. Ids only.
+     */
+    private mergeFallbackChain(
+        incoming: BYOKConfig,
+        existing: BYOKConfig | undefined,
+        organizationAndTeamData: OrganizationAndTeamData,
+    ): BYOKConfig {
+        const merged = mergeFallbackChainOnWrite(incoming, existing);
+        const changed =
+            merged.previousTail.length !== merged.tail.length ||
+            merged.previousTail.some((id, i) => id !== merged.tail[i]);
+        if (changed || merged.pruned.length > 0) {
+            this.logger.warn({
+                message: merged.tail.length
+                    ? 'BYOK fallback chain tail changed'
+                    : 'BYOK fallback chain tail cleared',
+                context: CreateOrUpdateOrganizationParametersUseCase.name,
+                metadata: {
+                    organizationId: organizationAndTeamData.organizationId,
+                    userId: this.request.user?.uuid,
+                    previousTail: merged.previousTail,
+                    tail: merged.tail,
+                    pruned: merged.pruned,
+                },
+            });
+        }
+        return merged.config;
+    }
+
+    /**
+     * A fallback-chain tail entry on a platform-funded (`kodus`) credential is
+     * refused: the enterprise UI's credit-balance alarm only looks at the
+     * models it shows, so a tail entry would spend prepaid credit with nothing
+     * on screen saying so. Stored entries of that kind were already pruned by
+     * the merge, so this only fires for an entry the request added.
+     */
+    private assertNoPlatformFundedFallbackTail(config: BYOKConfig): void {
+        const offending = platformFundedTailEntries(config);
+        if (offending.length > 0) {
+            throw new BadRequestException({
+                message:
+                    'Invalid BYOK configuration: a Kodus-funded model can only be the first fallback',
+                errors: offending.map(
+                    (id) =>
+                        `routing.fallbackModelIds "${id}" uses the Kodus provider, which is not allowed after the first fallback`,
+                ),
+            });
+        }
     }
 
     /**

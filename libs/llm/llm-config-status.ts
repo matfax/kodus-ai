@@ -18,6 +18,7 @@ import {
     type BYOKModelConfig,
     type NormalizedModel,
 } from './byok-config';
+import { fallbackChainOf } from './byok-fallback-chain';
 import { resolveDefaultSlot } from './resolve-model-slot';
 import { describeEnvLLMConfig, type EnvLLMProviderId } from './env-llm-config';
 // Barrel import (side-effect self-registers every provider module), so
@@ -143,6 +144,13 @@ export interface LLMConfigStatus {
      * resolved slot for back-compat).
      */
     models: LLMModelStatus[];
+    /**
+     * The org's normalized fallback chain (`models[]` ids, head first, capped at
+     * MAX_FALLBACKS), as every runtime reader sees it. The enterprise routing
+     * tab shows only the head, so this is where support can see the tail.
+     * Empty when no fallback is configured or the blob is not a BYOK config.
+     */
+    fallbackChain: string[];
     byok: {
         configured: boolean;
         model?: string;
@@ -278,5 +286,9 @@ export function describeLLMConfigStatus(configValue: unknown): LLMConfigStatus {
         ? enumerateModels(configValue, envDescriptor.configured)
         : [];
 
-    return { source, models, byok, env };
+    const fallbackChain = isByokConfig(configValue)
+        ? fallbackChainOf(configValue.routing)
+        : [];
+
+    return { source, models, fallbackChain, byok, env };
 }

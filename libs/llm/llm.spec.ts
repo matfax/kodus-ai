@@ -1,15 +1,16 @@
 /**
  * llm.spec.ts — the `LLM.run` WIRING of runtime model failover (the seam between
- * a slot's `.fallback` and the executor cascade). The executors, the classifier
+ * a slot's `.fallbacks` and the executor cascade). The executors, the classifier
  * and the logger are mocked so these tests pin only what `run` is responsible for:
- *   - build the attempts `[slot, slot.fallback]` and inject each as `byokConfig`;
- *   - cascade one-shot calls to the fallback on a cascade-worthy failure;
+ *   - build the attempts `[slot, ...slot.fallbacks]` and inject each as `byokConfig`;
+ *   - cascade one-shot calls down the chain on a cascade-worthy failure;
  *   - guard the agent loop so a step that already ran vetoes the cascade.
  * The cascade decision itself lives in `model-failover.spec.ts`.
  */
 jest.mock('@libs/core/log/logger', () => ({
     createLogger: () => ({
         warn: jest.fn(),
+        log: jest.fn(),
         info: jest.fn(),
         error: jest.fn(),
         debug: jest.fn(),
@@ -30,6 +31,9 @@ jest.mock('@libs/llm/error-classifier', () => ({
     classifyLLMError: (e: any) => ({ category: e?.__cat ?? 'UNKNOWN' }),
     isTerminalCategory: (c: string) => c === 'AUTH_INVALID',
     isAbortOrHardTimeout: (e: any) => !!e?.__abort,
+    isCallerAbortOrBudget: (e: any) => !!e?.__abort,
+    isProviderTimeout: (e: any) => !!e?.__providerTimeout,
+    failureChain: (e: any) => (e && typeof e === 'object' ? [e] : []),
 }));
 
 const runStructuredReviewCall = jest.fn();
@@ -53,6 +57,11 @@ jest.mock('./resolve-task-model', () => ({
 
 import { LLM } from './llm';
 import type { NormalizedModel } from './byok-config';
+import {
+    circuitKeyFor,
+    DEFAULT_CIRCUIT_CONFIG,
+    providerCircuit,
+} from './provider-circuit';
 
 const authErr = () => Object.assign(new Error('unauth'), { __cat: 'AUTH_INVALID' });
 const transientErr = () =>
@@ -67,12 +76,29 @@ const slotWithFallback: NormalizedModel = {
     byokModelId: 'p',
     provider: 'openai',
     apiKey: 'enc',
-    fallback: {
-        model: 'fallback',
-        byokModelId: 'f',
+    fallbacks: [
+        {
+            model: 'fallback',
+            byokModelId: 'f',
+            provider: 'openai',
+            apiKey: 'enc',
+            chainIndex: 0,
+        },
+    ],
+} as any;
+
+const slotWithChain: NormalizedModel = {
+    model: 'primary',
+    byokModelId: 'p',
+    provider: 'openai',
+    apiKey: 'enc',
+    fallbacks: ['f1', 'f2', 'f3'].map((id, chainIndex) => ({
+        model: id,
+        byokModelId: id,
         provider: 'openai',
         apiKey: 'enc',
-    },
+        chainIndex,
+    })),
 } as any;
 
 const bareSlot: NormalizedModel = {
@@ -95,7 +121,7 @@ beforeEach(() => {
 });
 
 describe('LLM.run — one-shot failover wiring', () => {
-    it('cascades to slot.fallback on a cascade-worthy failure', async () => {
+    it('cascades to slot.fallbacks[0] on a cascade-worthy failure', async () => {
         runTextReviewCall
             .mockRejectedValueOnce(authErr())
             .mockResolvedValueOnce('from-fallback');
@@ -111,6 +137,42 @@ describe('LLM.run — one-shot failover wiring', () => {
         // primary then fallback, each injected as byokConfig
         expect(runTextReviewCall.mock.calls[0][0].byokConfig.model).toBe('primary');
         expect(runTextReviewCall.mock.calls[1][0].byokConfig.model).toBe('fallback');
+    });
+
+    it('tells each one-shot attempt whether a next model exists (hasNextModel)', async () => {
+        // D-00c reads it: a provider timeout goes to the next entry instead of
+        // being re-issued on the stalled route.
+        runTextReviewCall
+            .mockRejectedValueOnce(transientErr())
+            .mockResolvedValueOnce('from-fallback');
+
+        await LLM.run({
+            byokConfig: slotWithFallback,
+            user: 'hi',
+            runName: 'r',
+        });
+
+        expect(runTextReviewCall.mock.calls[0][0].hasNextModel).toBe(true);
+        expect(runTextReviewCall.mock.calls[1][0].hasNextModel).toBe(false);
+
+        runTextReviewCall.mockReset().mockResolvedValueOnce('solo');
+        await LLM.run({ byokConfig: bareSlot, user: 'hi', runName: 'r' });
+        expect(runTextReviewCall.mock.calls[0][0].hasNextModel).toBe(false);
+    });
+
+    it('cascades a provider timeout to the fallback', async () => {
+        runTextReviewCall
+            .mockRejectedValueOnce(
+                Object.assign(new Error('Gateway Timeout'), {
+                    __cat: 'TRANSIENT',
+                    __providerTimeout: true,
+                }),
+            )
+            .mockResolvedValueOnce('from-fallback');
+
+        await expect(
+            LLM.run({ byokConfig: slotWithFallback, user: 'hi', runName: 'r' }),
+        ).resolves.toBe('from-fallback');
     });
 
     it('does not cascade when there is no fallback on the slot', async () => {
@@ -143,6 +205,44 @@ describe('LLM.run — one-shot failover wiring', () => {
         expect(out).toEqual({ ok: true });
         expect(runStructuredReviewCall).toHaveBeenCalledTimes(2);
     });
+
+    it('walks the whole chain in order, injecting each entry as byokConfig', async () => {
+        runTextReviewCall
+            .mockRejectedValueOnce(authErr())
+            .mockRejectedValueOnce(transientErr())
+            .mockRejectedValueOnce(authErr())
+            .mockResolvedValueOnce('from-f3');
+
+        const out = await LLM.run({
+            byokConfig: slotWithChain,
+            user: 'hi',
+            runName: 'r',
+        });
+
+        expect(out).toBe('from-f3');
+        expect(
+            runTextReviewCall.mock.calls.map(([p]) => [
+                p.byokConfig.model,
+                p.hasNextModel,
+            ]),
+        ).toEqual([
+            ['primary', true],
+            ['f1', true],
+            ['f2', true],
+            ['f3', false],
+        ]);
+    });
+
+    it('stops the chain at the first error that must not cascade', async () => {
+        runTextReviewCall
+            .mockRejectedValueOnce(authErr())
+            .mockRejectedValueOnce(unknownErr('opaque'));
+
+        await expect(
+            LLM.run({ byokConfig: slotWithChain, user: 'hi', runName: 'r' }),
+        ).rejects.toThrow('opaque');
+        expect(runTextReviewCall).toHaveBeenCalledTimes(2);
+    });
 });
 
 describe('LLM.run — agent-loop failover guard', () => {
@@ -174,6 +274,238 @@ describe('LLM.run — agent-loop failover guard', () => {
 
         await expect(LLM.run(loopReq as any)).rejects.toThrow('unauth');
         expect(runAgentLoopCall).toHaveBeenCalledTimes(1);
+    });
+
+    it('walks the chain before any step, and stops once the caller signal aborts', async () => {
+        const controller = new AbortController();
+        runAgentLoopCall
+            .mockRejectedValueOnce(authErr())
+            .mockImplementationOnce(() => {
+                controller.abort();
+                return Promise.reject(transientErr());
+            });
+
+        await expect(
+            LLM.run({
+                ...loopReq,
+                byokConfig: slotWithChain,
+                signal: controller.signal,
+            } as any),
+        ).rejects.toThrow('5xx');
+        expect(
+            runAgentLoopCall.mock.calls.map(([p]) => p.byokConfig.model),
+        ).toEqual(['primary', 'f1']);
+    });
+});
+
+describe('LLM.run — per-attempt round-trip deadline', () => {
+    const env = { ...process.env };
+    afterEach(() => {
+        process.env = { ...env };
+    });
+
+    it('arms the loop deadline only while a next entry exists and no step has run', async () => {
+        delete process.env.LLM_FAILOVER_ROUND_TRIP_DEADLINE_MS;
+        const seen: Array<{ ms?: number; source: string; active: boolean[] }> =
+            [];
+        runAgentLoopCall.mockImplementationOnce((params: any) => {
+            const active = [params.roundTrip.isActive()];
+            params.loop.onStepFinish?.({ step: 1 });
+            active.push(params.roundTrip.isActive());
+            seen.push({ ...params.roundTrip, active });
+            return Promise.resolve({ text: 'ok' });
+        });
+
+        await LLM.run({
+            byokConfig: slotWithFallback,
+            runName: 'r',
+            messages: [],
+            loop: { tools: {}, maxSteps: 3 },
+        } as any);
+        expect(seen[0]).toMatchObject({
+            ms: 5 * 60 * 1000,
+            source: 'round-trip',
+            active: [true, false],
+        });
+    });
+
+    it('never arms it on the last entry', async () => {
+        runAgentLoopCall.mockImplementationOnce((params: any) => {
+            expect(params.roundTrip.isActive()).toBe(false);
+            return Promise.resolve({ text: 'ok' });
+        });
+        await LLM.run({
+            byokConfig: bareSlot,
+            runName: 'r',
+            messages: [],
+            loop: { tools: {}, maxSteps: 3 },
+        } as any);
+        expect(runAgentLoopCall).toHaveBeenCalledTimes(1);
+    });
+
+    it("takes a one-shot caller's shorter budget as the deadline, labelled caller-budget", async () => {
+        runTextReviewCall.mockResolvedValueOnce('ok');
+        await LLM.run({
+            byokConfig: slotWithFallback,
+            user: 'u',
+            runName: 'r',
+            timeoutMs: 90_000,
+        });
+        const { roundTrip } = runTextReviewCall.mock.calls[0][0];
+        expect(roundTrip).toMatchObject({
+            ms: 90_000,
+            source: 'caller-budget',
+        });
+        expect(roundTrip.isActive()).toBe(true);
+    });
+
+    it('arms nothing when the knob is off', async () => {
+        process.env.LLM_FAILOVER_ROUND_TRIP_DEADLINE_MS = 'off';
+        runTextReviewCall.mockResolvedValueOnce('ok');
+        await LLM.run({
+            byokConfig: slotWithFallback,
+            user: 'u',
+            runName: 'r',
+        });
+        expect(runTextReviewCall.mock.calls[0][0].roundTrip.ms).toBeUndefined();
+    });
+
+    it('tags a fallback attempt span with its chain position and the reason it runs', async () => {
+        runTextReviewCall
+            .mockRejectedValueOnce(authErr())
+            .mockResolvedValueOnce('ok');
+        await LLM.run({
+            byokConfig: slotWithFallback,
+            user: 'u',
+            runName: 'r',
+            attrs: { phase: 'p' },
+        });
+        expect(runTextReviewCall.mock.calls[0][0].attrs).toEqual({
+            phase: 'p',
+        });
+        expect(runTextReviewCall.mock.calls[1][0].attrs).toEqual({
+            phase: 'p',
+            chainIndex: 1,
+            failoverReason: 'AUTH_INVALID',
+        });
+    });
+});
+
+describe('LLM.run — the answer hook resolves a half-open probe', () => {
+    const env = { ...process.env };
+    const ORG = 'org-probe';
+    const key = () => circuitKeyFor(slotWithFallback, ORG)!;
+    beforeEach(() => {
+        providerCircuit.reset();
+        delete process.env.LLM_CIRCUIT_MODE;
+        process.env.LLM_CIRCUIT_OPEN_MS = '1';
+    });
+    afterEach(() => {
+        process.env = { ...env };
+        providerCircuit.reset();
+    });
+
+    it("closes the primary on the loop's first answer, before the loop settles", async () => {
+        // Open the primary, then let its 1 ms open period lapse.
+        for (let i = 0; i < DEFAULT_CIRCUIT_CONFIG.failureThreshold; i++) {
+            const { ticket } = providerCircuit.admit(key(), {
+                isLast: false,
+                probeLeaseMs: 60_000,
+            });
+            providerCircuit.onFailure(ticket);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        expect(providerCircuit.stateOf(key())).toBe('half-open');
+
+        let duringLoop: string | undefined;
+        runAgentLoopCall.mockImplementationOnce((params: any) => {
+            // The BYOK wrapper calls this on the provider's first answer.
+            params.roundTrip.onAnswered();
+            params.loop.onStepFinish?.({ step: 1 });
+            duringLoop = providerCircuit.stateOf(key());
+            return Promise.reject(transientErr());
+        });
+
+        await expect(
+            LLM.run({
+                byokConfig: slotWithFallback,
+                organizationId: ORG,
+                runName: 'r',
+                messages: [],
+                loop: { tools: {}, maxSteps: 3 },
+            } as any),
+        ).rejects.toThrow('5xx');
+        expect(duringLoop).toBe('closed');
+        // The failure after the step is stale against the closed key.
+        expect(providerCircuit.stateOf(key())).toBe('closed');
+    });
+});
+
+describe('LLM.run — per-attempt loop tools (toolsForModel)', () => {
+    it("builds each attempt's tools from that attempt's model", async () => {
+        const toolsForModel = jest.fn((modelId: string | undefined) => ({
+            [`tools-for-${modelId}`]: {},
+        }));
+        runAgentLoopCall
+            .mockRejectedValueOnce(authErr())
+            .mockRejectedValueOnce(authErr())
+            .mockResolvedValueOnce('loop-f2');
+
+        const out = await LLM.run({
+            byokConfig: slotWithChain,
+            runName: 'r',
+            messages: [],
+            loop: { tools: { base: {} }, toolsForModel, maxSteps: 5 },
+        } as any);
+
+        expect(out).toBe('loop-f2');
+        expect(toolsForModel.mock.calls.map(([id]) => id)).toEqual([
+            'primary',
+            'f1',
+            'f2',
+        ]);
+        const sent = runAgentLoopCall.mock.calls.map(([p]) => p.loop);
+        expect(sent.map((l) => Object.keys(l.tools))).toEqual([
+            ['tools-for-primary'],
+            ['tools-for-f1'],
+            ['tools-for-f2'],
+        ]);
+        // resolved here, so the executor never sees the seam itself
+        expect(sent.every((l) => !('toolsForModel' in l))).toBe(true);
+    });
+
+    it('passes undefined for the managed default (no slot)', async () => {
+        const toolsForModel = jest.fn(() => ({ managed: {} }));
+        runAgentLoopCall.mockResolvedValueOnce('ok');
+
+        await LLM.run({
+            runName: 'r',
+            messages: [],
+            loop: { tools: {}, toolsForModel, maxSteps: 5 },
+        } as any);
+
+        expect(toolsForModel).toHaveBeenCalledWith(undefined);
+        expect(runAgentLoopCall.mock.calls[0][0].loop.tools).toEqual({
+            managed: {},
+        });
+    });
+
+    it('sends loop.tools unchanged when no toolsForModel is given', async () => {
+        const tools = { t: {} };
+        runAgentLoopCall
+            .mockRejectedValueOnce(authErr())
+            .mockResolvedValueOnce('ok');
+
+        await LLM.run({
+            byokConfig: slotWithFallback,
+            runName: 'r',
+            messages: [],
+            loop: { tools, maxSteps: 5 },
+        } as any);
+
+        expect(
+            runAgentLoopCall.mock.calls.map(([p]) => p.loop.tools),
+        ).toEqual([tools, tools]);
     });
 });
 

@@ -2,11 +2,16 @@ import {
     OrganizationParametersConfigKey,
     Timezone,
 } from '@services/parameters/types';
-import { useQuery } from '@tanstack/react-query';
-import { useFetch, useSuspenseFetch } from 'src/core/utils/reactQuery';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import {
+    generateQueryKey,
+    useFetch,
+    useSuspenseFetch,
+} from 'src/core/utils/reactQuery';
 import type { BYOKConfig } from 'src/features/ee/byok/_types';
 
 import { ORGANIZATION_PARAMETERS_PATHS } from '.';
+import { setByokFallbackChain } from "./fallback-chain";
 import {
     getModelCapabilities,
     previewLLMProviderModels,
@@ -148,4 +153,28 @@ export function useSuspenseGetBYOK() {
             fallbackData: null,
         },
     );
+}
+
+/**
+ * Replace the org's fallback chain. On success the cached BYOK config is
+ * refetched, so every reader of `useSuspenseGetBYOK` sees the stored chain.
+ */
+export function useSetByokFallbackChain() {
+    const queryClient = useQueryClient();
+
+    return useMutation({
+        mutationFn: (modelIds: string[]) => setByokFallbackChain(modelIds),
+        onSuccess: () =>
+            queryClient.invalidateQueries({
+                // The key `useSuspenseGetBYOK` caches under.
+                queryKey: generateQueryKey(
+                    ORGANIZATION_PARAMETERS_PATHS.GET_BY_KEY,
+                    {
+                        params: {
+                            key: OrganizationParametersConfigKey.BYOK_CONFIG,
+                        },
+                    },
+                ),
+            }),
+    });
 }
