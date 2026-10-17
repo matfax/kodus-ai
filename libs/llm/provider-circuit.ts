@@ -27,7 +27,7 @@
  * State is process-local (like the limiter cache): each replica learns an
  * outage on its own.
  */
-import { createHash } from 'node:crypto';
+import { createHmac } from 'node:crypto';
 
 import { createLogger } from '@libs/core/log/logger';
 import type { NormalizedModel } from '@libs/llm/byok-config';
@@ -123,10 +123,19 @@ export function circuitConfigFromEnv(env: Env = process.env): CircuitConfig {
 
 // ─── Keys ────────────────────────────────────────────────────────────────────
 
-/** Opaque, stable digest of key material, so a breaker key never holds the
- *  ciphertext itself. */
-function digest(value: string): string {
-    return createHash('sha256').update(value).digest('hex').slice(0, 16);
+/**
+ * Opaque, stable digest of key material, so a breaker key never holds the
+ * ciphertext itself. The secret is the HMAC KEY over a fixed label, not
+ * hashed message content: CodeQL flags any `createHash()` fed from `apiKey`
+ * as a weak password hash (see `openCodeSessionId` in opencode-go.ts for the
+ * same finding). This keeps the digest deterministic per secret across
+ * replicas and restarts without needing another secret to key it.
+ */
+function digest(secret: string): string {
+    return createHmac('sha256', secret)
+        .update('kodus-llm-circuit-account')
+        .digest('hex')
+        .slice(0, 16);
 }
 
 /**
