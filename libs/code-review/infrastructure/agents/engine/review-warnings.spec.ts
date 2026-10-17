@@ -101,6 +101,33 @@ describe('buildProviderFallbackWarning', () => {
         expect(warning.contextWindowTokens).toBe(0);
     });
 
+    it('says the main model was skipped when its circuit breaker was open', () => {
+        const [warning] = withFallbackWarnings(undefined, [
+            {
+                failedModel: 'main',
+                usedModel: 'fb',
+                hops: [
+                    {
+                        model: 'main',
+                        chainIndex: 0,
+                        outcome: 'skipped',
+                        reason: 'circuit-open',
+                        elapsedMs: 0,
+                    },
+                ],
+            },
+        ])!;
+        expect(warning.detail).toBe(
+            'main provider main skipped (circuit open); review ran on fallback fb',
+        );
+        expect(
+            buildProviderFallbackWarning({
+                failedModel: 'main',
+                usedModel: 'fb',
+            }).detail,
+        ).toBe('main provider main failed; review ran on fallback fb');
+    });
+
     it('folds per-agent fallback notices into one dashboard entry', () => {
         const out = dedupReviewWarnings([
             buildProviderFallbackWarning({

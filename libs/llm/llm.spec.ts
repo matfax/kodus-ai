@@ -10,6 +10,7 @@
 jest.mock('@libs/core/log/logger', () => ({
     createLogger: () => ({
         warn: jest.fn(),
+        log: jest.fn(),
         info: jest.fn(),
         error: jest.fn(),
         debug: jest.fn(),
@@ -32,6 +33,7 @@ jest.mock('@libs/llm/error-classifier', () => ({
     isAbortOrHardTimeout: (e: any) => !!e?.__abort,
     isCallerAbortOrBudget: (e: any) => !!e?.__abort,
     isProviderTimeout: (e: any) => !!e?.__providerTimeout,
+    failureChain: (e: any) => (e && typeof e === 'object' ? [e] : []),
 }));
 
 const runStructuredReviewCall = jest.fn();
@@ -288,6 +290,99 @@ describe('LLM.run — agent-loop failover guard', () => {
         expect(
             runAgentLoopCall.mock.calls.map(([p]) => p.byokConfig.model),
         ).toEqual(['primary', 'f1']);
+    });
+});
+
+describe('LLM.run — per-attempt round-trip deadline', () => {
+    const env = { ...process.env };
+    afterEach(() => {
+        process.env = { ...env };
+    });
+
+    it('arms the loop deadline only while a next entry exists and no step has run', async () => {
+        delete process.env.LLM_FAILOVER_ROUND_TRIP_DEADLINE_MS;
+        const seen: Array<{ ms?: number; source: string; active: boolean[] }> =
+            [];
+        runAgentLoopCall.mockImplementationOnce((params: any) => {
+            const active = [params.roundTrip.isActive()];
+            params.loop.onStepFinish?.({ step: 1 });
+            active.push(params.roundTrip.isActive());
+            seen.push({ ...params.roundTrip, active });
+            return Promise.resolve({ text: 'ok' });
+        });
+
+        await LLM.run({
+            byokConfig: slotWithFallback,
+            runName: 'r',
+            messages: [],
+            loop: { tools: {}, maxSteps: 3 },
+        } as any);
+        expect(seen[0]).toMatchObject({
+            ms: 5 * 60 * 1000,
+            source: 'round-trip',
+            active: [true, false],
+        });
+    });
+
+    it('never arms it on the last entry', async () => {
+        runAgentLoopCall.mockImplementationOnce((params: any) => {
+            expect(params.roundTrip.isActive()).toBe(false);
+            return Promise.resolve({ text: 'ok' });
+        });
+        await LLM.run({
+            byokConfig: bareSlot,
+            runName: 'r',
+            messages: [],
+            loop: { tools: {}, maxSteps: 3 },
+        } as any);
+        expect(runAgentLoopCall).toHaveBeenCalledTimes(1);
+    });
+
+    it("takes a one-shot caller's shorter budget as the deadline, labelled caller-budget", async () => {
+        runTextReviewCall.mockResolvedValueOnce('ok');
+        await LLM.run({
+            byokConfig: slotWithFallback,
+            user: 'u',
+            runName: 'r',
+            timeoutMs: 90_000,
+        });
+        const { roundTrip } = runTextReviewCall.mock.calls[0][0];
+        expect(roundTrip).toMatchObject({
+            ms: 90_000,
+            source: 'caller-budget',
+        });
+        expect(roundTrip.isActive()).toBe(true);
+    });
+
+    it('arms nothing when the knob is off', async () => {
+        process.env.LLM_FAILOVER_ROUND_TRIP_DEADLINE_MS = 'off';
+        runTextReviewCall.mockResolvedValueOnce('ok');
+        await LLM.run({
+            byokConfig: slotWithFallback,
+            user: 'u',
+            runName: 'r',
+        });
+        expect(runTextReviewCall.mock.calls[0][0].roundTrip.ms).toBeUndefined();
+    });
+
+    it('tags a fallback attempt span with its chain position and the reason it runs', async () => {
+        runTextReviewCall
+            .mockRejectedValueOnce(authErr())
+            .mockResolvedValueOnce('ok');
+        await LLM.run({
+            byokConfig: slotWithFallback,
+            user: 'u',
+            runName: 'r',
+            attrs: { phase: 'p' },
+        });
+        expect(runTextReviewCall.mock.calls[0][0].attrs).toEqual({
+            phase: 'p',
+        });
+        expect(runTextReviewCall.mock.calls[1][0].attrs).toEqual({
+            phase: 'p',
+            chainIndex: 1,
+            failoverReason: 'AUTH_INVALID',
+        });
     });
 });
 

@@ -16,6 +16,7 @@
 jest.mock('@libs/core/log/logger', () => {
     const log = {
         warn: jest.fn(),
+        log: jest.fn(),
         info: jest.fn(),
         error: jest.fn(),
         debug: jest.fn(),
@@ -49,6 +50,8 @@ jest.mock('@libs/llm/error-classifier', () => {
         isCallerAbortOrBudget: (e: any) => e?.__abort === true,
         isProviderTimeout: (e: any) => e?.__providerTimeout === true,
         retriesWereExhausted: (e: any) => e?.__exhausted === true,
+        // The breaker reads the chain for our deadline; one layer is enough.
+        failureChain: (e: any) => (e && typeof e === 'object' ? [e] : []),
     };
 });
 
@@ -63,12 +66,14 @@ import {
     type FailoverAttemptControl,
 } from './model-failover';
 import type { NormalizedModel } from './byok-config';
+import { providerCircuit } from './provider-circuit';
 import { createLogger } from '@libs/core/log/logger';
 
 // The mocked createLogger always returns the same spy instance model-failover
 // captured at module load, so this is that exact instance.
 const mockLog = createLogger('test') as unknown as {
     warn: jest.Mock;
+    log: jest.Mock;
     info: jest.Mock;
     error: jest.Mock;
     debug: jest.Mock;
@@ -819,5 +824,137 @@ describe('the failed attempt is recorded ON the error', () => {
         expect(readAttemptedSlot(new Error('unrelated'))).toBeUndefined();
         expect(readAttemptedSlot(undefined)).toBeUndefined();
         expect(readAttemptedSlot('a string')).toBeUndefined();
+    });
+});
+
+describe('runWithModelFailover — the circuit breaker', () => {
+    // One counted failure opens a key, so each test can set its state up in a
+    // single call. The mocked classifier counts TRANSIENT.
+    const opts = { runName: 'test', organizationId: 'org-1' };
+    const env = { ...process.env };
+    beforeEach(() => {
+        process.env.LLM_CIRCUIT_FAILURE_THRESHOLD = '1';
+        delete process.env.LLM_CIRCUIT_MODE;
+        providerCircuit.reset();
+    });
+    afterEach(() => {
+        process.env = { ...env };
+        providerCircuit.reset();
+    });
+
+    /** Open the breaker on `model` by failing it once as a non-last entry. */
+    async function openOn(model: string): Promise<void> {
+        await runWithModelFailover(
+            [slot(model), slot('opener-fallback')],
+            jest
+                .fn()
+                .mockRejectedValueOnce(err('TRANSIENT'))
+                .mockResolvedValueOnce('ok'),
+            opts,
+        );
+    }
+
+    it('skips an open entry and records the skip as a hop', async () => {
+        await openOn('A');
+        const runOne = jest.fn().mockResolvedValue('ok');
+        const { failovers } = await recordModelFailovers(() =>
+            runWithModelFailover([slot('A'), slot('B')], runOne, opts),
+        );
+        expect(runOne).toHaveBeenCalledTimes(1);
+        expect(runOne.mock.calls[0][0].model).toBe('B');
+        expect(failovers[0].hops).toEqual([
+            expect.objectContaining({
+                model: 'A',
+                outcome: 'skipped',
+                reason: 'circuit-open',
+            }),
+        ]);
+        // The attempt that ran knows why it is running.
+        expect(runOne.mock.calls[0][1]).toMatchObject({
+            chainIndex: 1,
+            failoverReason: 'circuit-open',
+        });
+    });
+
+    it('never skips the last entry', async () => {
+        await openOn('A');
+        const runOne = jest.fn().mockResolvedValue('ok');
+        await expect(
+            runWithModelFailover([slot('A')], runOne, opts),
+        ).resolves.toBe('ok');
+        expect(runOne).toHaveBeenCalledTimes(1);
+        expect(runOne.mock.calls[0][1].circuitState).toBe('open');
+    });
+
+    it('runs the last entry forced when every entry is open', async () => {
+        await openOn('A');
+        await openOn('B');
+        const runOne = jest.fn().mockResolvedValue('ok');
+        const { failovers } = await recordModelFailovers(() =>
+            runWithModelFailover([slot('A'), slot('B')], runOne, opts),
+        );
+        expect(runOne.mock.calls.map((c) => c[0].model)).toEqual(['B']);
+        expect(failovers[0].hops.map((h) => h.outcome)).toEqual(['skipped']);
+    });
+
+    it('shadow mode runs everything', async () => {
+        process.env.LLM_CIRCUIT_MODE = 'shadow';
+        await openOn('A');
+        mockLog.log.mockClear();
+        const runOne = jest.fn().mockResolvedValue('ok');
+        await runWithModelFailover([slot('A'), slot('B')], runOne, opts);
+        expect(runOne.mock.calls.map((c) => c[0].model)).toEqual(['A']);
+        expect(
+            mockLog.log.mock.calls.some((c) =>
+                String(c[0]?.message).includes('would-skip'),
+            ),
+        ).toBe(true);
+    });
+
+    it('does not count an uncounted category (rate limit, abort)', async () => {
+        for (const e of [
+            err('RATE_LIMIT'),
+            err('TRANSIENT', { __abort: true }),
+        ]) {
+            await runWithModelFailover(
+                [slot('A'), slot('B')],
+                jest.fn().mockRejectedValueOnce(e).mockResolvedValue('ok'),
+                opts,
+            ).catch(() => undefined);
+        }
+        const runOne = jest.fn().mockResolvedValue('ok');
+        await runWithModelFailover([slot('A'), slot('B')], runOne, opts);
+        expect(runOne.mock.calls[0][0].model).toBe('A');
+    });
+
+    it('still counts a failure after markUnsafeToRetry', async () => {
+        await runWithModelFailover(
+            [slot('A'), slot('B')],
+            async (_s, control: FailoverAttemptControl) => {
+                control.markUnsafeToRetry();
+                throw err('TRANSIENT');
+            },
+            opts,
+        ).catch(() => undefined);
+        const runOne = jest.fn().mockResolvedValue('ok');
+        await runWithModelFailover([slot('A'), slot('B')], runOne, opts);
+        expect(runOne.mock.calls[0][0].model).toBe('B');
+    });
+
+    it('applies no breaker without an org', async () => {
+        await runWithModelFailover(
+            [slot('A'), slot('B')],
+            jest
+                .fn()
+                .mockRejectedValueOnce(err('TRANSIENT'))
+                .mockResolvedValueOnce('ok'),
+            { runName: 'test' },
+        );
+        const runOne = jest.fn().mockResolvedValue('ok');
+        await runWithModelFailover([slot('A'), slot('B')], runOne, {
+            runName: 'test',
+        });
+        expect(runOne.mock.calls[0][0].model).toBe('A');
+        expect(runOne.mock.calls[0][1].circuitState).toBeUndefined();
     });
 });

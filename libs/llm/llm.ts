@@ -43,16 +43,19 @@ import {
     type AgentLoopSeams,
 } from '@libs/llm/agent-loop-call';
 import {
+    roundTripDeadlineFor,
     runWithModelFailover,
     type FailoverAttemptControl,
 } from '@libs/llm/model-failover';
+import type { ByokRoundTrip } from '@libs/llm/byok-model-wrapper';
+import { LLM_CALL_TIMEOUT_MS } from '@libs/llm/llm-call';
 
 /** The raw AI SDK result an agent-loop call returns (steps / usage / text). */
 export type AgentLoopResult = Awaited<ReturnType<typeof generateText>>;
 
 export interface LlmRequest extends Omit<
     BaseReviewCallParams,
-    'byokConfig' | 'user' | 'hasNextModel'
+    'byokConfig' | 'user' | 'hasNextModel' | 'roundTrip'
 > {
     /** A pre-resolved slot — the caller already routed task → slot. */
     byokConfig?: NormalizedModel;
@@ -121,7 +124,7 @@ function resolveSlot(req: LlmRequest): NormalizedModel | undefined {
  */
 function toExecutorParams(
     req: LlmRequest,
-): Omit<BaseReviewCallParams, 'byokConfig' | 'hasNextModel'> {
+): Omit<BaseReviewCallParams, 'byokConfig' | 'hasNextModel' | 'roundTrip'> {
     const {
         config: _config,
         task: _task,
@@ -137,7 +140,10 @@ function toExecutorParams(
         // one-shot executor honors them as fixed-tuning overrides (demo paths).
         ...rest
     } = req;
-    return rest as Omit<BaseReviewCallParams, 'byokConfig' | 'hasNextModel'>;
+    return rest as Omit<
+        BaseReviewCallParams,
+        'byokConfig' | 'hasNextModel' | 'roundTrip'
+    >;
 }
 
 /**
@@ -167,6 +173,62 @@ function loopForAttempt(
             return inner?.(event);
         },
     };
+}
+
+/**
+ * One attempt's round-trip deadline, handed to the BYOK wrapper.
+ *
+ * It exists only to buy a cascade, so it is active only while one is possible:
+ * a next chain entry exists and (loop mode) no step has run. The last entry,
+ * the only entry and every loop step after the first behave exactly as without
+ * it. A one-shot caller with a shorter `timeoutMs` than the knob gets that
+ * budget as its deadline (`caller-budget`): the call cascades at the budget
+ * instead of failing as a plain timeout, but the breaker does not count it.
+ *
+ * The answer hook reports to the breaker on every attempt, deadline or not.
+ */
+function roundTripFor(
+    slot: NormalizedModel | undefined,
+    control: FailoverAttemptControl,
+    callerBudgetMs?: number,
+): ByokRoundTrip {
+    const knob = roundTripDeadlineFor(slot);
+    const fromCaller =
+        knob !== undefined &&
+        callerBudgetMs !== undefined &&
+        callerBudgetMs < knob;
+    return {
+        ms: fromCaller ? callerBudgetMs : knob,
+        source: fromCaller ? 'caller-budget' : 'round-trip',
+        isActive: () => control.hasNext && !control.isUnsafe(),
+        onAnswered: () => control.onAnswered(),
+    };
+}
+
+/**
+ * The span attributes of one attempt: the caller's, plus where the attempt sits
+ * in the chain and why it got there. Added only when they say something (a
+ * fallback attempt, a breaker that is not CLOSED), so a call that ran on its
+ * primary records exactly the attributes it always did.
+ */
+function attemptAttrs(
+    attrs: Record<string, unknown> | undefined,
+    control: FailoverAttemptControl,
+): Record<string, unknown> | undefined {
+    const extra: Record<string, unknown> = {
+        // `usedFallback` is already on the span: a chain entry's slot carries
+        // it from routing.
+        ...(control.chainIndex > 0
+            ? {
+                  chainIndex: control.chainIndex,
+                  failoverReason: control.failoverReason,
+              }
+            : {}),
+        ...(control.circuitState && control.circuitState !== 'closed'
+            ? { circuitState: control.circuitState }
+            : {}),
+    };
+    return Object.keys(extra).length ? { ...(attrs ?? {}), ...extra } : attrs;
 }
 
 export class LLM {
@@ -213,7 +275,7 @@ export class LLM {
                         loop: loopForAttempt(loop, attemptSlot, control),
                         runName: req.runName,
                         spanName: req.spanName,
-                        attrs: req.attrs,
+                        attrs: attemptAttrs(req.attrs, control),
                         organizationId: req.organizationId,
                         reporter: req.reporter,
                         queueTimeoutMs: req.queueTimeoutMs,
@@ -223,6 +285,7 @@ export class LLM {
                         signal: req.signal,
                         maxOutputTokens: req.maxOutputTokens,
                         temperature: req.temperature,
+                        roundTrip: roundTripFor(attemptSlot, control),
                     }),
                 // The loop's signal is the caller's budget: once it has aborted,
                 // no further chain entry is started on it. One-shot calls carry
@@ -244,7 +307,13 @@ export class LLM {
                 const params: BaseReviewCallParams = {
                     ...baseParams,
                     byokConfig: attemptSlot,
+                    attrs: attemptAttrs(baseParams.attrs, control),
                     hasNextModel: control.hasNext,
+                    roundTrip: roundTripFor(
+                        attemptSlot,
+                        control,
+                        baseParams.timeoutMs ?? LLM_CALL_TIMEOUT_MS,
+                    ),
                 };
                 return schema
                     ? runStructuredReviewCall({ ...params, schema })

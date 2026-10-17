@@ -14,6 +14,7 @@ import { estimateTextTokens } from '@libs/llm/token-estimate';
 import { wrapByokModel } from './byok-model-wrapper';
 import { clearRefusals, MAX_REFUSAL_RETRIES } from './rejected-reasoning-field';
 import { getLimiterForSlot } from './byok-to-vercel';
+import { ProviderDeadlineError } from './provider-deadline-error';
 
 const estimateMock = estimateTextTokens as unknown as jest.Mock;
 
@@ -675,5 +676,307 @@ describe('wrapByokModel — a reasoning field the upstream refuses', () => {
             reporter,
         }).doGenerate(withThinking);
         expect(reporter).not.toHaveBeenCalled();
+    });
+});
+
+describe('wrapByokModel — the failover round-trip deadline (fake timers)', () => {
+    const MS = 1_000;
+    const OK = {
+        content: [{ type: 'text', text: 'ok' }],
+        finishReason: 'stop',
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        warnings: [],
+    };
+    const abortError = () =>
+        new DOMException('This operation was aborted', 'AbortError');
+
+    /** A provider whose n-th request is answered by `answer`: after a delay,
+     *  with an error after the delay, or never ('hang'). A pending request
+     *  rejects on its abort signal unless `ignoresAbort`. */
+    function provider(
+        answer: (n: number) => { delayMs?: number; error?: Error } | 'hang',
+        opts: { ignoresAbort?: boolean } = {},
+    ) {
+        let n = 0;
+        const releases: Array<() => void> = [];
+        const signals: Array<AbortSignal | undefined> = [];
+        const doGenerate = jest.fn((params: any) => {
+            n += 1;
+            signals.push(params.abortSignal);
+            const plan = answer(n);
+            return new Promise((resolve, reject) => {
+                releases.push(() => resolve(OK));
+                if (!opts.ignoresAbort) {
+                    params.abortSignal?.addEventListener('abort', () =>
+                        reject(abortError()),
+                    );
+                }
+                if (plan === 'hang') return;
+                setTimeout(
+                    () => (plan.error ? reject(plan.error) : resolve(OK)),
+                    plan.delayMs ?? 0,
+                );
+            });
+        });
+        return {
+            model: {
+                specificationVersion: 'v4',
+                provider: 'test-provider',
+                modelId: 'test-model',
+                supportedUrls: {},
+                doGenerate,
+                doStream: jest.fn(),
+            } as any,
+            doGenerate,
+            signals,
+            /** Let every pending request finally answer. */
+            releaseAll: () => releases.forEach((r) => r()),
+        };
+    }
+
+    let keySeq = 0;
+    const slotFor = (over: Partial<NormalizedModel> = {}): NormalizedModel =>
+        ({
+            provider: BYOKProvider.OPENAI,
+            apiKey: `cipher-deadline-${++keySeq}`,
+            model: 'gpt-4o',
+            ...over,
+        }) as NormalizedModel;
+
+    function wrapWithDeadline(
+        model: any,
+        s: NormalizedModel,
+        over: {
+            isActive?: () => boolean;
+            onAnswered?: () => void;
+            reporter?: jest.Mock;
+        } = {},
+    ) {
+        return wrapByokModel(model, {
+            byokConfig: s,
+            organizationId: 'org-1',
+            provider: 'openai',
+            reporter: over.reporter,
+            roundTrip: {
+                ms: MS,
+                source: 'round-trip',
+                isActive: over.isActive ?? (() => true),
+                onAnswered: over.onAnswered,
+            },
+        });
+    }
+
+    /** Track a promise's outcome without letting it reject unhandled. */
+    function outcome<T>(p: PromiseLike<T>) {
+        const box: { done: boolean; value?: T; error?: unknown } = {
+            done: false,
+        };
+        Promise.resolve(p).then(
+            (value) => Object.assign(box, { done: true, value }),
+            (error) => Object.assign(box, { done: true, error }),
+        );
+        return box;
+    }
+
+    beforeEach(() => {
+        jest.useFakeTimers({ now: 0 });
+        estimateMock.mockReset();
+    });
+    afterEach(() => {
+        jest.clearAllTimers();
+        jest.useRealTimers();
+    });
+
+    it('throws ProviderDeadlineError when the provider does not answer in time', async () => {
+        const p = provider(() => 'hang');
+        const reporter = jest.fn();
+        const res = outcome(
+            wrapWithDeadline(p.model, slotFor(), { reporter }).doGenerate({
+                prompt: PROMPT,
+            }),
+        );
+        await jest.advanceTimersByTimeAsync(MS - 1);
+        expect(res.done).toBe(false);
+        await jest.advanceTimersByTimeAsync(1);
+        expect(res.error).toBeInstanceOf(ProviderDeadlineError);
+        expect(res.error).toMatchObject({
+            deadlineMs: MS,
+            source: 'round-trip',
+            phase: 'round-trip',
+            model: 'gpt-4o',
+        });
+        // The request was really cancelled, through a signal armed although
+        // the caller passed none.
+        expect(p.signals[0]?.aborted).toBe(true);
+        expect(reporter).toHaveBeenCalledWith(
+            expect.objectContaining({ deadline: true }),
+        );
+    });
+
+    it("rethrows the caller's AbortError when the caller's signal fired first", async () => {
+        const p = provider(() => 'hang');
+        const caller = new AbortController();
+        const res = outcome(
+            wrapWithDeadline(p.model, slotFor()).doGenerate({
+                prompt: PROMPT,
+                abortSignal: caller.signal,
+            }),
+        );
+        await jest.advanceTimersByTimeAsync(MS / 2);
+        caller.abort();
+        await jest.advanceTimersByTimeAsync(MS);
+        expect(res.error).not.toBeInstanceOf(ProviderDeadlineError);
+        expect((res.error as Error).name).toBe('AbortError');
+    });
+
+    it('settles the caller of an abort-ignoring provider while its limiter slot stays held', async () => {
+        const p = provider((n) => (n === 1 ? 'hang' : { delayMs: 0 }), {
+            ignoresAbort: true,
+        });
+        const wrapped = wrapWithDeadline(
+            p.model,
+            slotFor({ maxConcurrentRequests: 1 }),
+        );
+        const first = outcome(wrapped.doGenerate({ prompt: PROMPT }));
+        const second = outcome(wrapped.doGenerate({ prompt: PROMPT }));
+
+        // The abort is ignored: the caller is released after the grace…
+        await jest.advanceTimersByTimeAsync(MS + 5_000 - 1);
+        expect(first.done).toBe(false);
+        await jest.advanceTimersByTimeAsync(1);
+        expect(first.error).toBeInstanceOf(ProviderDeadlineError);
+
+        // …but the request is still open, so the slot is not handed on.
+        expect(p.doGenerate).toHaveBeenCalledTimes(1);
+        expect(second.done).toBe(false);
+
+        // Once the stalled request finally settles, the queued call runs.
+        p.releaseAll();
+        await jest.advanceTimersByTimeAsync(0);
+        expect(p.doGenerate).toHaveBeenCalledTimes(2);
+        await jest.advanceTimersByTimeAsync(MS);
+        expect(second.value).toMatchObject({ finishReason: 'stop' });
+    });
+
+    it('caps how long a request that never settles holds the slot', async () => {
+        const p = provider((n) => (n === 1 ? 'hang' : { delayMs: 0 }), {
+            ignoresAbort: true,
+        });
+        const wrapped = wrapWithDeadline(
+            p.model,
+            slotFor({ maxConcurrentRequests: 1 }),
+        );
+        outcome(wrapped.doGenerate({ prompt: PROMPT }));
+        const second = outcome(wrapped.doGenerate({ prompt: PROMPT }));
+
+        await jest.advanceTimersByTimeAsync(MS + 60_000 - 1);
+        expect(p.doGenerate).toHaveBeenCalledTimes(1);
+        await jest.advanceTimersByTimeAsync(1);
+        expect(p.doGenerate).toHaveBeenCalledTimes(2);
+        await jest.advanceTimersByTimeAsync(MS);
+        expect(second.value).toMatchObject({ finishReason: 'stop' });
+    });
+
+    it('does not count limiter queue wait against the deadline', async () => {
+        const p = provider((n) => ({ delayMs: n === 1 ? 3 * MS : MS / 2 }));
+        const s = slotFor({ maxConcurrentRequests: 1 });
+        // The first call holds the only slot for three deadlines, with no
+        // deadline of its own (a caller outside LLM.run).
+        const blocker = outcome(
+            wrapByokModel(p.model, {
+                byokConfig: s,
+                organizationId: 'org-1',
+            }).doGenerate({ prompt: PROMPT }),
+        );
+        const queued = outcome(
+            wrapWithDeadline(p.model, s).doGenerate({ prompt: PROMPT }),
+        );
+        await jest.advanceTimersByTimeAsync(3 * MS + MS / 2);
+        expect(blocker.value).toBeDefined();
+        expect(queued.error).toBeUndefined();
+        expect(queued.value).toMatchObject({ finishReason: 'stop' });
+    });
+
+    it('gives each refusal re-ask its own deadline', async () => {
+        clearRefusals();
+        const refusal = Object.assign(
+            new Error('json: unknown field "thinking"'),
+            {
+                statusCode: 400,
+                responseBody:
+                    '{"error":{"message":"invalid request body: json: unknown field \\"thinking\\""}}',
+                requestBodyValues: {
+                    model: 'm',
+                    thinking: { type: 'enabled' },
+                },
+            },
+        );
+        // Each request takes 80% of the deadline: together they exceed it.
+        const p = provider((n) =>
+            n === 1
+                ? { delayMs: 0.8 * MS, error: refusal }
+                : { delayMs: 0.8 * MS },
+        );
+        const s = {
+            provider: 'openai_compatible',
+            apiKey: `cipher-deadline-${++keySeq}`,
+            model: 'glm-5.3-flash',
+            baseURL: 'https://opencode.ai/zen/go/v1',
+        } as unknown as NormalizedModel;
+        const res = outcome(
+            wrapWithDeadline(p.model, s).doGenerate({
+                prompt: PROMPT,
+                providerOptions: {
+                    openaiCompatible: { thinking: { type: 'enabled' } },
+                },
+            } as any),
+        );
+        await jest.advanceTimersByTimeAsync(2 * MS);
+        expect(p.doGenerate).toHaveBeenCalledTimes(2);
+        expect(res.error).toBeUndefined();
+        expect(res.value).toMatchObject({ finishReason: 'stop' });
+        clearRefusals();
+    });
+
+    it('arms nothing while inactive (last entry, or a loop step already ran)', async () => {
+        const p = provider(() => ({ delayMs: 3 * MS }));
+        const res = outcome(
+            wrapWithDeadline(p.model, slotFor(), {
+                isActive: () => false,
+            }).doGenerate({ prompt: PROMPT }),
+        );
+        await jest.advanceTimersByTimeAsync(3 * MS);
+        expect(res.value).toMatchObject({ finishReason: 'stop' });
+        // The provider got the caller's signal untouched (none here).
+        expect(p.signals[0]).toBeUndefined();
+    });
+
+    it('reports every provider answer, deadline or not, and never a failure', async () => {
+        const onAnswered = jest.fn();
+        const ok = provider(() => ({ delayMs: 10 }));
+        const active = outcome(
+            wrapWithDeadline(ok.model, slotFor(), { onAnswered }).doGenerate({
+                prompt: PROMPT,
+            }),
+        );
+        const inactive = outcome(
+            wrapWithDeadline(ok.model, slotFor(), {
+                onAnswered,
+                isActive: () => false,
+            }).doGenerate({ prompt: PROMPT }),
+        );
+        await jest.advanceTimersByTimeAsync(10);
+        expect(active.value && inactive.value).toBeTruthy();
+        expect(onAnswered).toHaveBeenCalledTimes(2);
+
+        const hung = provider(() => 'hang');
+        const failed = outcome(
+            wrapWithDeadline(hung.model, slotFor(), { onAnswered }).doGenerate({
+                prompt: PROMPT,
+            }),
+        );
+        await jest.advanceTimersByTimeAsync(MS);
+        expect(failed.error).toBeInstanceOf(ProviderDeadlineError);
+        expect(onAnswered).toHaveBeenCalledTimes(2);
     });
 });

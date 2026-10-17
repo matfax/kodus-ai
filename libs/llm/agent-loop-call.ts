@@ -31,6 +31,7 @@ import {
 } from 'ai';
 
 import type { NormalizedModel } from '@libs/llm/byok-config';
+import type { ByokRoundTrip } from '@libs/llm/byok-model-wrapper';
 import { resolveModelConfig } from '@libs/llm/model-invocation';
 import { agentModelIdentity } from '@libs/llm/model-identity';
 import { applyCacheBreakpoints } from '@libs/llm/prompt-cache';
@@ -125,6 +126,12 @@ export interface AgentLoopParams {
     maxOutputTokens?: number;
     /** Override the slot's sampling temperature. */
     temperature?: number;
+    /** The failover attempt's round-trip deadline (set by `LLM.run`): each
+     *  provider request is bounded by it while the attempt can still cascade,
+     *  i.e. a next chain entry exists and no step has run. Once a step ran the
+     *  loop is exactly as without it — SDK retries, undici's bound and the
+     *  AGENT_TIMEOUT_MS ceiling. */
+    roundTrip?: ByokRoundTrip;
 }
 
 /**
@@ -158,6 +165,7 @@ export async function runAgentLoopCall(
         reporter,
         provider: params.provider,
         queueTimeoutMs: params.queueTimeoutMs,
+        ...(params.roundTrip ? { roundTrip: params.roundTrip } : {}),
         // Default reasoning effort matches what conversation / business / fetcher
         // used before this primitive (resolveModelConfig's own 'low' default).
         // The review finder never relies on it — it passes a providerOptions

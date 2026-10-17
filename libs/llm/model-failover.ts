@@ -15,14 +15,33 @@
  * precedence (per-agent → default) is a SEPARATE concern owned by the router,
  * not re-walked here. The cascade stops at the first success, at an error that
  * must not cascade, once an attempt marked itself unsafe to restart, or when
- * the caller's signal has aborted.
+ * the caller's signal has aborted. Between calls, the circuit breaker
+ * (`provider-circuit.ts`) lets the cascade skip an entry whose model keeps
+ * failing, so the next call does not pay to learn the outage again.
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
 
 import { createLogger } from '@libs/core/log/logger';
 import { LLM_ERROR_TAG, LLM_SUCCESS_TAG } from '@libs/llm/log-tags';
 import type { NormalizedModel } from '@libs/llm/byok-config';
-import { isProviderDeadlineError } from '@libs/llm/provider-deadline-error';
+import { getLimiterForSlot } from '@libs/llm/byok-limiter';
+import { LLM_CALL_TIMEOUT_MS } from '@libs/llm/llm-call';
+import {
+    circuitCountsFailure,
+    circuitKeyFor,
+    circuitLabelsFor,
+    LLM_CIRCUIT_TAG,
+    providerCircuit,
+    retryAfterMsOf,
+    type CircuitAdmission,
+    type CircuitState,
+} from '@libs/llm/provider-circuit';
+import {
+    failoverRoundTripDeadlineMs,
+    isProviderDeadlineError,
+    MAX_ROUND_TRIP_DEADLINE_MS,
+} from '@libs/llm/provider-deadline-error';
+import { REGISTRY } from '@libs/llm/providers';
 import {
     classifyLLMError,
     isAbortOrHardTimeout,
@@ -167,6 +186,26 @@ export function providerTimeoutCascadeEnabled(
     return !(raw === 'off' || raw === 'false' || raw === '0');
 }
 
+/**
+ * The round-trip deadline for one chain entry: the env knob, raised to the
+ * provider's declared minimum (a cold-start provider declares one) and kept
+ * under the clamp. Undefined when the knob is off.
+ */
+export function roundTripDeadlineFor(
+    slot: NormalizedModel | undefined,
+): number | undefined {
+    const knob = failoverRoundTripDeadlineMs();
+    if (knob === undefined) return undefined;
+    const floor =
+        slot && REGISTRY.has(slot.provider)
+            ? REGISTRY.get(slot.provider).minRoundTripDeadlineMs
+            : undefined;
+    return Math.min(Math.max(knob, floor ?? 0), MAX_ROUND_TRIP_DEADLINE_MS);
+}
+
+/** A probe lease outlives the probe's own deadline by this margin. */
+const PROBE_LEASE_MARGIN_MS = 10_000;
+
 /** Handed to each attempt so it can veto its own retry. */
 export interface FailoverAttemptControl {
     /** True once this attempt called `markUnsafeToRetry`. */
@@ -186,6 +225,19 @@ export interface FailoverAttemptControl {
      * committed until they return) and never call this, so they always fail over.
      */
     markUnsafeToRetry(): void;
+    /**
+     * The provider answered a request of this attempt. Wired to the BYOK
+     * wrapper's answer hook: a half-open circuit probe resolves here, on the
+     * first answer, not when a long loop finally ends. Idempotent.
+     */
+    onAnswered(): void;
+    /** Position of this attempt in the runtime chain: 0 = the primary. */
+    readonly chainIndex: number;
+    /** The breaker state this attempt was admitted under; undefined when no
+     *  breaker applies (no org, the managed default, mode off). */
+    readonly circuitState?: CircuitState;
+    /** Why the previous chain entry did not answer; undefined on the primary. */
+    readonly failoverReason?: FailoverHopReason;
 }
 
 /** Distinct, order-preserving attempts. Drops a chain entry that resolves to the
@@ -307,6 +359,50 @@ function hopReason(
     return category;
 }
 
+/** Ask the circuit breaker about one chain entry. Undefined when no breaker
+ *  applies: mode off, the managed default, a BYOK slot without an org. */
+function admitAttempt(
+    slot: NormalizedModel | undefined,
+    isLast: boolean,
+    opts: { organizationId?: string },
+): CircuitAdmission | undefined {
+    const key = circuitKeyFor(slot, opts.organizationId);
+    if (!key || providerCircuit.currentMode() === 'off') return undefined;
+    return providerCircuit.admit(key, {
+        isLast,
+        labels: circuitLabelsFor(slot, opts.organizationId),
+        probeLeaseMs:
+            (roundTripDeadlineFor(slot) ?? LLM_CALL_TIMEOUT_MS) +
+            PROBE_LEASE_MARGIN_MS,
+        isCoolingDown: () =>
+            !!getLimiterForSlot({
+                slot,
+                organizationId: opts.organizationId,
+            })?.isInCooldown(),
+    });
+}
+
+/**
+ * Tell the breaker how an attempt failed. Only a failure that says the
+ * provider is unwell AND moved the call on counts (`circuitCountsFailure`);
+ * anything else just hands a probe lease back. A failure after
+ * `markUnsafeToRetry` still counts — the generation on the ticket decides
+ * whether it is still news.
+ */
+function reportAttemptFailure(
+    ticket: CircuitAdmission['ticket'],
+    err: unknown,
+): void {
+    if (!ticket) return;
+    if (circuitCountsFailure(err) && shouldFailoverToNextModel(err)) {
+        providerCircuit.onFailure(ticket, {
+            retryAfterMs: retryAfterMsOf(err),
+        });
+    } else {
+        providerCircuit.release(ticket);
+    }
+}
+
 /**
  * Run `runOne` on the primary slot; on a cascade-worthy failure it could not
  * recover from, re-run on the next chain entry (the tail of `slots`), in order.
@@ -315,6 +411,11 @@ function hopReason(
  * or `opts.signal` has aborted (the caller's budget is gone, so the next entry
  * is not started). With a single slot this is a thin pass-through — `runOne` is
  * invoked exactly once.
+ *
+ * Before each attempt the circuit breaker is asked (`admitAttempt`): an entry
+ * whose model keeps failing is skipped — recorded as a `circuit-open` hop —
+ * unless it is the last, which always runs. The attempt reports its first
+ * provider answer and its counted failures back to the breaker.
  */
 export async function runWithModelFailover<T>(
     slots: Array<NormalizedModel | undefined>,
@@ -329,18 +430,70 @@ export async function runWithModelFailover<T>(
     const nameOf = (i: number) => attempts[i]?.model ?? 'managed-default';
 
     for (let i = 0; i < attempts.length; i++) {
+        const attemptSlot = attempts[i];
+        const isLastEntry = i >= attempts.length - 1;
+        const admission = admitAttempt(attemptSlot, isLastEntry, opts);
+        if (admission?.decision === 'skip') {
+            hops.push({
+                model: nameOf(i),
+                chainIndex: i,
+                outcome: 'skipped',
+                reason: 'circuit-open',
+                elapsedMs: 0,
+            });
+            logger.log({
+                message: `${LLM_CIRCUIT_TAG} ${opts.runName}: "${nameOf(i)}" skipped (circuit ${admission.state}); trying "${nameOf(i + 1)}"`,
+                context: 'runWithModelFailover',
+                metadata: {
+                    runName: opts.runName,
+                    organizationId: opts.organizationId,
+                    chainIndex: i,
+                    circuitState: admission.state,
+                    fromModelId: attemptSlot?.byokModelId,
+                    toModelId: attempts[i + 1]?.byokModelId,
+                },
+            });
+            continue;
+        }
+        if (admission?.wouldSkip) {
+            logger.log({
+                message: `${LLM_CIRCUIT_TAG} ${opts.runName}: "${nameOf(i)}" would-skip (circuit ${admission.state}, shadow mode)`,
+                context: 'runWithModelFailover',
+                metadata: {
+                    runName: opts.runName,
+                    organizationId: opts.organizationId,
+                    chainIndex: i,
+                    circuitState: admission.state,
+                    modelId: attemptSlot?.byokModelId,
+                },
+            });
+        }
+        const ticket = admission?.ticket ?? null;
+
         let unsafeToRetry = false;
+        let answered = false;
+        const onAnswered = () => {
+            if (answered) return;
+            answered = true;
+            providerCircuit.onSuccess(ticket);
+        };
         const control: FailoverAttemptControl = {
-            hasNext: i < attempts.length - 1,
+            hasNext: !isLastEntry,
             isUnsafe: () => unsafeToRetry,
             markUnsafeToRetry: () => {
                 unsafeToRetry = true;
             },
+            onAnswered,
+            chainIndex: i,
+            circuitState: admission?.state,
+            failoverReason: hops.at(-1)?.reason,
         };
         const startedAt = Date.now();
 
         try {
-            const result = await runOne(attempts[i], control);
+            const result = await runOne(attemptSlot, control);
+            // A result is an answer, whether or not the executor reported it.
+            onAnswered();
             if (i > 0) {
                 failoverRecorder.getStore()?.push({
                     runName: opts.runName,
@@ -377,11 +530,11 @@ export async function runWithModelFailover<T>(
                 reason,
                 elapsedMs: Date.now() - startedAt,
             });
+            reportAttemptFailure(ticket, err);
 
-            const isLast = i >= attempts.length - 1;
             const callerAborted = !!opts.signal?.aborted;
             if (
-                isLast ||
+                isLastEntry ||
                 unsafeToRetry ||
                 callerAborted ||
                 !shouldFailoverToNextModel(err)
@@ -406,7 +559,7 @@ export async function runWithModelFailover<T>(
                         reason,
                         modelId: attempts[i]?.byokModelId,
                         chainIndex: i,
-                        exhausted: isLast,
+                        exhausted: isLastEntry,
                         callerAborted,
                         hops,
                     },
@@ -443,7 +596,7 @@ export async function runWithModelFailover<T>(
     }
 
     // Unreachable: `distinctAttempts` guarantees ≥1 attempt, and the LAST one always
-    // throws in the catch above (`isLast`). This satisfies the compiler's need for a
+    // throws in the catch above (`isLastEntry`). This satisfies the compiler's need for a
     // terminal path without carrying a dead "last error" across iterations.
     throw new Error(
         `runWithModelFailover(${opts.runName}): exhausted attempts without returning`,

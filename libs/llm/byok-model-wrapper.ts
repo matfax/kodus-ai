@@ -1,7 +1,9 @@
 /**
  * Wrap a model so every generate goes through the BYOK concurrency limiter
  * (process-wide rate limit) AND reports BYOK failures (drives the
- * `byok.llm_errors_threshold` notification).
+ * `byok.llm_errors_threshold` notification). Inside `LLM.run` it also arms the
+ * failover round-trip deadline on each provider request, and reports each
+ * provider answer to the circuit breaker.
  *
  * Done at the MODEL level (AI SDK `wrapLanguageModel`) so any agent runner stays
  * model-agnostic — the failure reporter is injected directly (no AsyncLocalStorage).
@@ -28,6 +30,13 @@ import {
     type ClassifiedErrorInfo,
 } from '@libs/llm/error-classifier';
 import { extractProviderMessage } from '@libs/llm/review-error-diagnostics';
+import {
+    isProviderDeadlineError,
+    ProviderDeadlineError,
+    ROUND_TRIP_SETTLE_GRACE_MS,
+    ROUND_TRIP_SLOT_HOLD_CAP_MS,
+    type ProviderDeadlineSource,
+} from '@libs/llm/provider-deadline-error';
 import { createLogger } from '@libs/core/log/logger';
 import {
     MAX_REFUSAL_RETRIES,
@@ -80,6 +89,25 @@ function extractUsageTotal(result: unknown): number | undefined {
     return sum > 0 ? sum : undefined;
 }
 
+/**
+ * One failover attempt's round-trip deadline and answer hook, built per attempt
+ * by `LLM.run`. Absent everywhere outside `LLM.run`, which means no deadline.
+ */
+export interface ByokRoundTrip {
+    /** The deadline for one provider request, or undefined when none is
+     *  configured. */
+    ms?: number;
+    /** `round-trip` at the full knob value; `caller-budget` when a one-shot
+     *  caller's shorter `timeoutMs` set it. Only the first trips the breaker. */
+    source: ProviderDeadlineSource;
+    /** Read when each request is armed: true only while a cascade is possible
+     *  (a next chain entry exists and no loop step has run). */
+    isActive: () => boolean;
+    /** Called on each provider answer, deadline or not: a half-open breaker
+     *  probe resolves on the first one. */
+    onAnswered?: () => void;
+}
+
 export interface WrapByokModelOptions {
     byokConfig?: NormalizedModel;
     organizationId?: string;
@@ -90,6 +118,7 @@ export interface WrapByokModelOptions {
      *  in a later cleanup wave. */
     role?: 'main' | 'fallback' | 'internal';
     queueTimeoutMs?: number;
+    roundTrip?: ByokRoundTrip;
     reporter?: (input: {
         organizationId?: string;
         provider: string;
@@ -98,7 +127,68 @@ export interface WrapByokModelOptions {
         category?: LlmErrorCategory;
         httpStatus?: number;
         routingRefusal?: boolean;
+        /** Our round-trip deadline killed the request. It is only armed when a
+         *  next chain entry exists, so the call moved on to that entry. */
+        deadline?: boolean;
     }) => void;
+}
+
+/** The armed deadline for one request: its signal, and whether it fired
+ *  before the caller's own. */
+interface ArmedDeadline {
+    signal: AbortSignal;
+    firedFirst: () => boolean;
+    error: ProviderDeadlineError;
+    disarm: () => void;
+}
+
+/** The caller's cancel, as the SDK would have thrown it. */
+function callerAbortReason(signal: AbortSignal | undefined): unknown {
+    return (
+        signal?.reason ??
+        new DOMException('This operation was aborted', 'AbortError')
+    );
+}
+
+function armDeadline(
+    ms: number,
+    source: ProviderDeadlineSource,
+    callerSignal: AbortSignal | undefined,
+    target: { provider?: string; model?: string },
+): ArmedDeadline {
+    const controller = new AbortController();
+    let first: 'deadline' | 'caller' | undefined = callerSignal?.aborted
+        ? 'caller'
+        : undefined;
+    const onCaller = () => {
+        first ??= 'caller';
+    };
+    callerSignal?.addEventListener('abort', onCaller, { once: true });
+    const timer = setTimeout(() => {
+        first ??= 'deadline';
+        controller.abort();
+    }, ms);
+    // An undefined caller signal is dropped, not handed to AbortSignal.any.
+    const signals = [callerSignal, controller.signal].filter(
+        (s): s is AbortSignal => !!s,
+    );
+    return {
+        signal: signals.length > 1 ? AbortSignal.any(signals) : signals[0],
+        firedFirst: () => first === 'deadline',
+        // No `cause`: the provider's AbortError on it would read as a caller
+        // cancel to the failover gate.
+        error: new ProviderDeadlineError({
+            deadlineMs: ms,
+            source,
+            phase: 'round-trip',
+            provider: target.provider,
+            model: target.model,
+        }),
+        disarm: () => {
+            clearTimeout(timer);
+            callerSignal?.removeEventListener('abort', onCaller);
+        },
+    };
 }
 
 export function wrapByokModel(
@@ -111,14 +201,85 @@ export function wrapByokModel(
             specificationVersion: 'v3',
             wrapGenerate: async ({ doGenerate, params, model: inner }: any) => {
                 const slot = opts.byokConfig;
+                // Settles the CALLER when a provider ignores the deadline's
+                // abort; the limiter slot stays held meanwhile (see `call`).
+                let settleCaller: ((err: unknown) => void) | undefined;
+                const callerSettled = new Promise<never>((_, reject) => {
+                    settleCaller = reject;
+                });
+                const send = (p: any) =>
+                    p === params ? doGenerate() : inner.doGenerate(p);
+                // One provider request. The round-trip deadline is armed here,
+                // per request: after limiter admission (queue wait never
+                // counts), anew for each refusal re-ask, and only while a
+                // cascade is possible.
+                const call = async (p: any) => {
+                    const roundTrip = opts.roundTrip;
+                    const ms = roundTrip?.ms;
+                    if (!roundTrip || !ms || ms <= 0 || !roundTrip.isActive()) {
+                        const answer = await send(p);
+                        roundTrip?.onAnswered?.();
+                        return answer;
+                    }
+                    const deadline = armDeadline(
+                        ms,
+                        roundTrip.source,
+                        p?.abortSignal,
+                        {
+                            provider: opts.provider ?? slot?.provider,
+                            model: slot?.model,
+                        },
+                    );
+                    const pending = send({
+                        ...p,
+                        abortSignal: deadline.signal,
+                    });
+                    // A proxy that ignores the abort never settles `pending`.
+                    // The caller is released after a grace, but this request
+                    // (and so the limiter slot) stays open until `pending`
+                    // settles, capped: the limiter's count keeps matching the
+                    // sockets actually open, as agent-loop-call explains.
+                    let grace: ReturnType<typeof setTimeout> | undefined;
+                    let cap: ReturnType<typeof setTimeout> | undefined;
+                    const capped = new Promise<never>((_, reject) => {
+                        grace = setTimeout(() => {
+                            if (deadline.firedFirst()) {
+                                settleCaller?.(deadline.error);
+                            }
+                        }, ms + ROUND_TRIP_SETTLE_GRACE_MS);
+                        // By the cap one of the two signals has fired: the
+                        // request ends as whichever did.
+                        cap = setTimeout(
+                            () =>
+                                reject(
+                                    deadline.firedFirst()
+                                        ? deadline.error
+                                        : callerAbortReason(p?.abortSignal),
+                                ),
+                            ms + ROUND_TRIP_SLOT_HOLD_CAP_MS,
+                        );
+                    });
+                    try {
+                        const answer = await Promise.race([pending, capped]);
+                        roundTrip.onAnswered?.();
+                        return answer;
+                    } catch (err) {
+                        // Whatever the provider threw once the deadline fired
+                        // first (its AbortError, a wrapped network error) is
+                        // our deadline; a caller abort stays the caller's.
+                        throw deadline.firedFirst() ? deadline.error : err;
+                    } finally {
+                        clearTimeout(grace);
+                        clearTimeout(cap);
+                        deadline.disarm();
+                    }
+                };
                 const generate = async () => {
                     const sent = withoutRefusedFields(
                         params,
                         slot,
                         opts.organizationId,
                     );
-                    const call = (p: any) =>
-                        p === params ? doGenerate() : inner.doGenerate(p);
                     // A strict upstream refuses one unknown field per answer
                     // (Go's decoder stops at the first), so each reasoning field
                     // we added can cost one more ask, never more than that: a
@@ -219,6 +380,9 @@ export function wrapByokModel(
                                 category: classified?.category,
                                 httpStatus: classified?.httpStatus,
                                 routingRefusal: classified?.routingRefusal,
+                                ...(isProviderDeadlineError(err)
+                                    ? { deadline: true }
+                                    : {}),
                             });
                         } catch {
                             /* reporter failures must not surface */
@@ -245,7 +409,7 @@ export function wrapByokModel(
                 // collapse to `unknown` (the middleware return type would then
                 // reject it). `run` yields exactly this, and `extractUsageTotal`
                 // takes `unknown`, so nothing else constrains T.
-                return runWithBYOKLimiter<ByokGenerateResult>(
+                const limited = runWithBYOKLimiter<ByokGenerateResult>(
                     {
                         slot,
                         organizationId: opts.organizationId,
@@ -257,6 +421,11 @@ export function wrapByokModel(
                     run,
                     'llm-call',
                 );
+                // Without a deadline nothing settles the caller early, so the
+                // call is exactly what it was.
+                return opts.roundTrip?.ms
+                    ? Promise.race([limited, callerSettled])
+                    : limited;
             },
         },
     });
