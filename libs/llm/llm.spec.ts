@@ -57,6 +57,11 @@ jest.mock('./resolve-task-model', () => ({
 
 import { LLM } from './llm';
 import type { NormalizedModel } from './byok-config';
+import {
+    circuitKeyFor,
+    DEFAULT_CIRCUIT_CONFIG,
+    providerCircuit,
+} from './provider-circuit';
 
 const authErr = () => Object.assign(new Error('unauth'), { __cat: 'AUTH_INVALID' });
 const transientErr = () =>
@@ -383,6 +388,56 @@ describe('LLM.run — per-attempt round-trip deadline', () => {
             chainIndex: 1,
             failoverReason: 'AUTH_INVALID',
         });
+    });
+});
+
+describe('LLM.run — the answer hook resolves a half-open probe', () => {
+    const env = { ...process.env };
+    const ORG = 'org-probe';
+    const key = () => circuitKeyFor(slotWithFallback, ORG)!;
+    beforeEach(() => {
+        providerCircuit.reset();
+        delete process.env.LLM_CIRCUIT_MODE;
+        process.env.LLM_CIRCUIT_OPEN_MS = '1';
+    });
+    afterEach(() => {
+        process.env = { ...env };
+        providerCircuit.reset();
+    });
+
+    it("closes the primary on the loop's first answer, before the loop settles", async () => {
+        // Open the primary, then let its 1 ms open period lapse.
+        for (let i = 0; i < DEFAULT_CIRCUIT_CONFIG.failureThreshold; i++) {
+            const { ticket } = providerCircuit.admit(key(), {
+                isLast: false,
+                probeLeaseMs: 60_000,
+            });
+            providerCircuit.onFailure(ticket);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        expect(providerCircuit.stateOf(key())).toBe('half-open');
+
+        let duringLoop: string | undefined;
+        runAgentLoopCall.mockImplementationOnce((params: any) => {
+            // The BYOK wrapper calls this on the provider's first answer.
+            params.roundTrip.onAnswered();
+            params.loop.onStepFinish?.({ step: 1 });
+            duringLoop = providerCircuit.stateOf(key());
+            return Promise.reject(transientErr());
+        });
+
+        await expect(
+            LLM.run({
+                byokConfig: slotWithFallback,
+                organizationId: ORG,
+                runName: 'r',
+                messages: [],
+                loop: { tools: {}, maxSteps: 3 },
+            } as any),
+        ).rejects.toThrow('5xx');
+        expect(duringLoop).toBe('closed');
+        // The failure after the step is stale against the closed key.
+        expect(providerCircuit.stateOf(key())).toBe('closed');
     });
 });
 

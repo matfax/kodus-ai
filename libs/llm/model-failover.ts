@@ -228,7 +228,8 @@ export interface FailoverAttemptControl {
     /**
      * The provider answered a request of this attempt. Wired to the BYOK
      * wrapper's answer hook: a half-open circuit probe resolves here, on the
-     * first answer, not when a long loop finally ends. Idempotent.
+     * first answer, not when a long loop finally ends. Idempotent, and a
+     * no-op once the attempt has failed: a late answer is not a recovery.
      */
     onAnswered(): void;
     /** Position of this attempt in the runtime chain: 0 = the primary. */
@@ -471,10 +472,14 @@ export async function runWithModelFailover<T>(
         const ticket = admission?.ticket ?? null;
 
         let unsafeToRetry = false;
-        let answered = false;
+        // Set on the first answer AND when the attempt fails: an answer that
+        // arrives after the failure was counted (a provider that ignored the
+        // deadline's abort and answered inside the slot-hold cap) is not news,
+        // and must not wipe the failure count it just raised.
+        let settled = false;
         const onAnswered = () => {
-            if (answered) return;
-            answered = true;
+            if (settled) return;
+            settled = true;
             providerCircuit.onSuccess(ticket);
         };
         const control: FailoverAttemptControl = {
@@ -530,6 +535,7 @@ export async function runWithModelFailover<T>(
                 reason,
                 elapsedMs: Date.now() - startedAt,
             });
+            settled = true;
             reportAttemptFailure(ticket, err);
 
             const callerAborted = !!opts.signal?.aborted;

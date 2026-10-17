@@ -3,21 +3,26 @@ import "@testing-library/jest-dom";
 
 import type { ReactNode } from "react";
 import { act, fireEvent, render, screen } from "@testing-library/react";
+import { AxiosError, AxiosHeaders } from "axios";
 import type { BYOKConfig } from "src/features/ee/byok/_types";
 
 import { ModelFallbacksPage } from "./_page-component";
 
 const mutateAsync = jest.fn();
 let stored: BYOKConfig;
+let mockCanEdit = true;
 
 jest.mock("@services/organizationParameters/hooks", () => ({
     useSuspenseGetBYOK: () => ({ configValue: stored }),
     useSetByokFallbackChain: () => ({ mutateAsync, isPending: false }),
 }));
 jest.mock("@services/permissions/hooks", () => ({
-    usePermission: () => true,
+    usePermission: () => mockCanEdit,
 }));
-jest.mock("@components/ui/toaster/use-toast", () => ({ toast: jest.fn() }));
+const mockToast = jest.fn();
+jest.mock("@components/ui/toaster/use-toast", () => ({
+    toast: (...args: unknown[]) => mockToast(...args),
+}));
 jest.mock("src/core/utils/revalidate-server-side", () => ({
     revalidateServerSidePath: jest.fn(() => Promise.resolve()),
 }));
@@ -48,7 +53,27 @@ const entries = () =>
 
 beforeEach(() => {
     mutateAsync.mockReset().mockResolvedValue(["model-b"]);
+    mockToast.mockClear();
+    mockCanEdit = true;
 });
+
+/** An API 400 as axios delivers it, with the use-case's message. */
+const apiError = (message: string) => {
+    const config = { headers: new AxiosHeaders() };
+    return new AxiosError(
+        "Request failed with status code 400",
+        "ERR_BAD_REQUEST",
+        config,
+        null,
+        {
+            status: 400,
+            statusText: "Bad Request",
+            headers: {},
+            config,
+            data: { message },
+        },
+    );
+};
 
 describe("ModelFallbacksPage", () => {
     it("lists the stored chain in order, with nothing to save yet", () => {
@@ -94,6 +119,65 @@ describe("ModelFallbacksPage", () => {
         });
 
         expect(mutateAsync).toHaveBeenCalledWith([]);
+    });
+
+    it("shows the API's message when the save is refused", async () => {
+        stored = config({ fallbackModelId: "model-b" });
+        mutateAsync.mockRejectedValue(
+            apiError("Fallback model model-gone is not connected"),
+        );
+        render(<ModelFallbacksPage />);
+
+        fireEvent.click(
+            screen.getByRole("button", { name: "Remove gpt-5-mini" }),
+        );
+        await act(async () => {
+            fireEvent.click(saveButton());
+        });
+
+        expect(mockToast).toHaveBeenCalledWith(
+            expect.objectContaining({
+                variant: "danger",
+                description: "Fallback model model-gone is not connected",
+            }),
+        );
+    });
+
+    it("falls back to a generic message when the error carries none", async () => {
+        stored = config({ fallbackModelId: "model-b" });
+        mutateAsync.mockRejectedValue(new Error("Network Error"));
+        render(<ModelFallbacksPage />);
+
+        fireEvent.click(
+            screen.getByRole("button", { name: "Remove gpt-5-mini" }),
+        );
+        await act(async () => {
+            fireEvent.click(saveButton());
+        });
+
+        expect(mockToast).toHaveBeenCalledWith(
+            expect.objectContaining({
+                variant: "danger",
+                description: "Please try again.",
+            }),
+        );
+    });
+
+    it("lets a member without the permission see the chain but not change it", () => {
+        mockCanEdit = false;
+        stored = config({
+            fallbackModelId: "model-b",
+            fallbackModelIds: ["model-b", "model-a"],
+        });
+        render(<ModelFallbacksPage />);
+
+        expect(
+            screen.getByRole("button", { name: "Move gpt-5 up" }),
+        ).toBeDisabled();
+        expect(
+            screen.getByRole("button", { name: "Remove gpt-5-mini" }),
+        ).toBeDisabled();
+        expect(saveButton()).toBeDisabled();
     });
 
     it("blocks the save while a Kodus-funded model is not first", () => {

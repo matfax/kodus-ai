@@ -18,6 +18,7 @@ import { APICallError } from '@ai-sdk/provider';
 
 import { createLogger } from '@libs/core/log/logger';
 import type { NormalizedModel } from './byok-config';
+import { classifyLLMError, LlmErrorCategory } from './error-classifier';
 import { ProviderDeadlineError } from './provider-deadline-error';
 import {
     circuitConfigFromEnv,
@@ -562,6 +563,30 @@ describe('circuitCountsFailure — what trips the breaker', () => {
     ])('does not count %s', async (_label, make) => {
         expect(circuitCountsFailure(await make())).toBe(false);
     });
+
+    it.each([
+        [
+            "Vertex's per-minute quota",
+            'Quota exceeded for aiplatform.googleapis.com/generate_content_requests_per_minute_per_project_per_base_model',
+        ],
+        ['a billing-worded 429', 'You exceeded your current quota, check your billing details'],
+    ])(
+        'never counts a 429 worded as %s, though it classifies QUOTA_EXCEEDED',
+        async (_label, message) => {
+            const e429 = await httpProviderError(
+                429,
+                'Too Many Requests',
+                jsonErrorBody(message),
+            );
+            expect(classifyLLMError(e429).category).toBe(
+                LlmErrorCategory.QUOTA_EXCEEDED,
+            );
+            expect(circuitCountsFailure(e429)).toBe(false);
+            expect(
+                circuitCountsFailure(await afterSdkRetries([e429, e429, e429])),
+            ).toBe(false);
+        },
+    );
 
     it('never counts an exhausted 429 either', async () => {
         const e429 = await httpProviderError(

@@ -17,8 +17,9 @@
  *  - The last (or only) chain entry is never skipped — every call makes at
  *    least one real attempt, and a single-model org sees no change.
  *  - Only failures a different model can fix count: a provider outage, an
- *    exhausted quota, our full-length round-trip deadline. A 429 never counts
- *    (the limiter owns those), nor does a caller's cancel or budget.
+ *    exhausted quota (402 or a non-429 billing error), our full-length
+ *    round-trip deadline. An HTTP 429 never counts, however it is worded (the
+ *    limiter owns those), nor does a caller's cancel or budget.
  *  - Every state change bumps a generation, and a result reported against an
  *    older generation is ignored: a loop admitted while CLOSED that ends forty
  *    minutes later cannot flip the state it never saw.
@@ -219,14 +220,15 @@ export function circuitLabelsFor(
  * Does this failure say the PROVIDER is unwell, in a way a different model can
  * fix? Only those trip the breaker:
  *  - a provider timeout (504/408/524, an undici timeout) or another TRANSIENT;
- *  - QUOTA_EXCEEDED;
+ *  - QUOTA_EXCEEDED, unless it came as a 429;
  *  - our round-trip deadline at its full length (`source: 'round-trip'`). One
  *    taken from a caller's shorter budget says the caller was in a hurry, not
  *    that the provider stalled.
  *
  * Never counted: a caller's cancel or budget (queue timeouts included), any
- * RATE_LIMIT (the limiter owns 429s; counting load-driven ones would divert
- * one-shot calls the cascade deliberately keeps on the primary), and the
+ * HTTP 429 whatever its category (the limiter owns 429s; counting load-driven
+ * ones would divert one-shot calls the cascade deliberately keeps on the
+ * primary), and the
  * per-call categories failover already handles (context overflow, auth, model
  * not found / denied, unknown, parse errors).
  *
@@ -235,6 +237,11 @@ export function circuitLabelsFor(
  */
 export function circuitCountsFailure(err: unknown): boolean {
     if (isCallerAbortOrBudget(err)) return false;
+    // Decided by status, not category: a per-minute limit worded as "quota"
+    // (Vertex's "Quota exceeded for …_per_minute…") classifies QUOTA_EXCEEDED,
+    // and a load spike must not open the primary. Quota exhaustion still
+    // counts when it arrives as a 402 or a non-429 billing error.
+    if (hasHttpStatus(err, 429)) return false;
     const deadline = failureChain(err).find(isProviderDeadlineError);
     if (deadline) {
         return (deadline as { source?: unknown }).source === 'round-trip';
@@ -245,6 +252,22 @@ export function circuitCountsFailure(err: unknown): boolean {
         category === LlmErrorCategory.TRANSIENT ||
         category === LlmErrorCategory.QUOTA_EXCEEDED
     );
+}
+
+/** Does any layer of the failure (a RetryError's last attempt, a `cause`)
+ *  carry this HTTP status? */
+function hasHttpStatus(err: unknown, status: number): boolean {
+    return failureChain(err).some((e) => {
+        const layer = e as {
+            status?: unknown;
+            statusCode?: unknown;
+            response?: { status?: unknown } | null;
+        };
+        return (
+            (layer.statusCode ?? layer.status ?? layer.response?.status) ===
+            status
+        );
+    });
 }
 
 /**

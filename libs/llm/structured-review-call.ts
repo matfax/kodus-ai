@@ -70,11 +70,13 @@ import { createLogger } from '@libs/core/log/logger';
 import { zodToStrictWireSchema } from '@libs/llm/strict-wire-schema';
 import {
     classifyLLMError,
+    failureChain,
     isAbortOrHardTimeout,
     isCallerAbortOrBudget,
     isProviderTimeout,
 } from '@libs/llm/error-classifier';
 import { providerTimeoutCascadeEnabled } from '@libs/llm/model-failover';
+import { isProviderDeadlineError } from '@libs/llm/provider-deadline-error';
 import {
     RETRYABLE_CATEGORY,
     jitteredBackoffMs,
@@ -816,6 +818,13 @@ async function runReviewCall<T>(
         // the whole 10-min budget again. The re-issue reuses the same call()
         // closure and its existing timeoutSignal(LLM_CALL_TIMEOUT_MS)/hardTimeout
         // chain — no fresh budget.
+        // Our own round-trip deadline is armed only while a next chain entry
+        // can take the call, so it always goes there, whatever the kill
+        // switch says: re-issuing would arm a fresh deadline on the route
+        // that just stalled and double the wait before the cascade.
+        if (failureChain(err).some(isProviderDeadlineError)) {
+            throw err;
+        }
         if (providerTimeoutCascadeEnabled()) {
             if (isCallerAbortOrBudget(err)) {
                 throw err;

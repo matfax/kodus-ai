@@ -181,6 +181,43 @@ describe('the circuit breaker in the failover cascade (real errors)', () => {
         expect(runOne.mock.calls[0][0]).toBe(PRIMARY);
     });
 
+    it('an answer arriving after a counted failure does not reset the count', async () => {
+        // A proxy that ignores the deadline's abort: the attempt fails (and
+        // counts), then the provider answers late, inside the slot-hold cap.
+        const e504 = await html504();
+        for (let i = 0; i < DEFAULT_CIRCUIT_CONFIG.failureThreshold; i++) {
+            let late: FailoverAttemptControl | undefined;
+            await runWithModelFailover(
+                chain,
+                async (s, control) => {
+                    if (s !== PRIMARY) return 'ok';
+                    late = control;
+                    throw e504;
+                },
+                opts,
+            );
+            late!.onAnswered();
+        }
+        expect(primaryState()).toBe('open');
+    });
+
+    it('exhausted per-minute 429s worded as quota cascade but never open the primary', async () => {
+        jest.useRealTimers();
+        const e429 = await httpProviderError(
+            429,
+            'Too Many Requests',
+            jsonErrorBody(
+                'Quota exceeded for aiplatform.googleapis.com/generate_content_requests_per_minute_per_project_per_base_model',
+            ),
+        );
+        const exhausted = await afterSdkRetries([e429, e429, e429]);
+        for (let i = 0; i < DEFAULT_CIRCUIT_CONFIG.failureThreshold + 2; i++) {
+            const { models } = await callFailingPrimary(async () => exhausted);
+            expect(models).toEqual(['primary', 'fallback']);
+        }
+        expect(primaryState()).toBe('closed');
+    });
+
     it('a plain 429 neither cascades nor counts', async () => {
         const e429 = await httpProviderError(
             429,

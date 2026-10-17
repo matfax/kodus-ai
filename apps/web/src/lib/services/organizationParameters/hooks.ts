@@ -11,7 +11,7 @@ import {
 import type { BYOKConfig } from 'src/features/ee/byok/_types';
 
 import { ORGANIZATION_PARAMETERS_PATHS } from '.';
-import { setByokFallbackChain } from './fallback-chain';
+import { setByokFallbackChain } from "./fallback-chain";
 import {
     getModelCapabilities,
     previewLLMProviderModels,

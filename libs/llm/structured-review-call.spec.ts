@@ -51,6 +51,7 @@ import {
     httpProviderError,
     jsonErrorBody,
 } from '@libs/llm/testing/provider-errors';
+import { ProviderDeadlineError } from '@libs/llm/provider-deadline-error';
 import { buildProviderOptions } from '@libs/llm/reasoning-options';
 import { setLlmObservability } from '@libs/llm/llm-observability';
 import {
@@ -1186,6 +1187,24 @@ describe('runStructuredReviewCall — D-00c is chain-aware (provider timeouts)',
             await runStructuredReviewCall({ ...base, hasNextModel: true });
 
             expect(mockGenerate).toHaveBeenCalledTimes(2);
+        });
+
+        it('our round-trip deadline is still THROWN to the next model, not re-issued', async () => {
+            // Re-issuing would arm a fresh deadline on the stalled route and
+            // double the wait before the cascade.
+            const err = new ProviderDeadlineError({
+                deadlineMs: 300_000,
+                source: 'round-trip',
+                phase: 'round-trip',
+                provider: 'openai',
+                model: 'gpt',
+            });
+            mockGenerate.mockRejectedValueOnce(err);
+
+            await expect(
+                runStructuredReviewCall({ ...base, hasNextModel: true }),
+            ).rejects.toBe(err);
+            expect(mockGenerate).toHaveBeenCalledTimes(1);
         });
     });
 });
