@@ -36,7 +36,7 @@ import {
 } from '@libs/agent-harness/infrastructure/verify/llm-verdict';
 import { createLogger } from '@libs/core/log/logger';
 import type { FinderSuggestion } from '@libs/code-review/infrastructure/agents/core/finder.agent';
-import { supportsStrictToolsForRun } from '@libs/code-review/infrastructure/agents/core/model-strictness';
+import { supportsStrictTools } from '@libs/code-review/infrastructure/agents/core/model-strictness';
 import type { PrDecisionRecord } from '@libs/code-review/domain/contracts/pr-decision-store.contract';
 import {
     buildLangfuseTelemetry,
@@ -69,10 +69,9 @@ const submitVerdictTool = {
 };
 
 export interface BuildVerifierSpecParams {
+    /** The primary model's id: decides strict tool use for `spec.tools`. Each
+     *  failover attempt gets its own decision through `spec.toolsForModel`. */
     modelId: string;
-    /** Failover target model id (when the slot has one). Strict tool use is only
-     *  enabled when BOTH it and `modelId` support it — see supportsStrictToolsForRun. */
-    fallbackModelId?: string;
     /** Cost-span run name (e.g. `code-review-bug-verify`) + agentName for the
      *  verify leaf usage span (bucketed to `review` by deriveArea). */
     runName?: string;
@@ -92,18 +91,16 @@ export function buildVerifierAgentSpec(
     // The HV2 system prompt is static (the per-finding evidence goes in the
     // run prompt), so we build it once with a placeholder bundle.
     const { system } = buildVerifierPrompt('', 0);
-    const tools = new InMemoryToolRegistry([
-        ...params.tools.list(),
-        // Strict/structured done-tool for strict-capable models (Gemini
-        // VALIDATED mode) so the verdict can't be omitted or emitted as prose.
-        {
-            ...submitVerdictTool,
-            strict: supportsStrictToolsForRun(
-                params.modelId,
-                params.fallbackModelId,
-            ),
-        },
-    ]);
+    // Strict/structured done-tool for strict-capable models (Gemini VALIDATED
+    // mode) so the verdict can't be omitted or emitted as prose. Decided per
+    // model, so a failover attempt on a non-strict fallback gets a tool it
+    // accepts while the Gemini primary keeps strict.
+    const toolsForModel = (modelId: string | undefined) =>
+        new InMemoryToolRegistry([
+            ...params.tools.list(),
+            { ...submitVerdictTool, strict: supportsStrictTools(modelId) },
+        ]);
+    const tools = toolsForModel(params.modelId);
     return {
         id: 'verifier',
         // Cost-span identity: LLM.run records the ONE verify usage span with this
@@ -113,6 +110,7 @@ export function buildVerifierAgentSpec(
         phase: 'verify',
         systemPrompt: system,
         tools,
+        toolsForModel,
         policies: [
             new BudgetPolicy(),
             // Without this the verify run can spend every step investigating and
@@ -244,9 +242,6 @@ function collectVerifierToolCalls(state: RunState): Verdict['toolCalls'] {
 
 export interface LlmVerifierParams {
     modelId: string;
-    /** Failover target model id — threaded to the verifier spec so strict tool
-     *  use accounts for it (a Gemini→OpenAI failover must not send strict). */
-    fallbackModelId?: string;
     tools: ToolRegistry;
     /** Depth for high-confidence findings (light verify). Default 5. */
     lightMaxSteps?: number;
@@ -310,7 +305,6 @@ export class LlmVerifier implements Verifier<FinderSuggestion> {
             : 'code-review-verify';
         this.lightSpec = buildVerifierAgentSpec({
             modelId: params.modelId,
-            fallbackModelId: params.fallbackModelId,
             runName: verifyRunName,
             agentName: params.agentName,
             tools: params.tools,
@@ -319,7 +313,6 @@ export class LlmVerifier implements Verifier<FinderSuggestion> {
         });
         this.fullSpec = buildVerifierAgentSpec({
             modelId: params.modelId,
-            fallbackModelId: params.fallbackModelId,
             runName: verifyRunName,
             agentName: params.agentName,
             tools: params.tools,

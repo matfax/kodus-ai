@@ -51,7 +51,6 @@ import { buildProviderOptions } from '@libs/llm/reasoning-options';
 // buildAgentAnomalies is review-specific (anomaly summary shapes) — lives in its
 // own module (relocated out of the legacy llm/agent-loop.ts).
 import { buildAgentAnomalies } from '@libs/code-review/infrastructure/agents/core/agent-anomalies';
-import { supportsStrictTools } from '@libs/code-review/infrastructure/agents/core/model-strictness';
 
 const funnelLogger = createLogger('review-funnel');
 
@@ -138,23 +137,14 @@ export async function runAgentLoopViaCore(
     // slot — the same id `buildModelFromSlot` would have stamped on the built
     // model. Undefined (managed/env default → no slot) degrades to 'resolved',
     // which disables strict — parity with before, since the managed default
-    // isn't a strict-capable (Gemini) model.
+    // isn't a strict-capable (Gemini) model. A failover onto a chain entry
+    // needs nothing here: the finder and verifier specs rebuild their tools
+    // for each attempt's model (AgentSpec.toolsForModel).
     const specModelId = secrets.byokConfig?.model ?? 'resolved';
-    // The runtime failover chain (if the slot has one). Strict tool use must
-    // account for it: LLM.run can swap primary → any chain entry mid-call, and a
-    // strict tool built for the primary would be rejected by a non-strict
-    // fallback (e.g. Gemini primary → OpenAI fallback). Handing on the first
-    // entry that cannot take strict (else the first entry) keeps
-    // supportsStrictToolsForRun's "every model that could run" rule.
-    const chain = secrets.byokConfig?.fallbacks ?? [];
-    const fallbackModelId = (
-        chain.find((entry) => !supportsStrictTools(entry.model)) ?? chain[0]
-    )?.model;
     const buildSpecWithLedger = (ledger: DiffCoverageLedger) =>
         buildFinderAgentSpec({
             systemPrompt: input.systemPrompt,
             modelId: specModelId,
-            fallbackModelId,
             usageRunName: input.usageRunName,
             agentName: input.agentName,
             tools,
@@ -221,7 +211,6 @@ export async function runAgentLoopViaCore(
             finderSpec,
             makeResampleSpec,
             modelId: specModelId,
-            fallbackModelId,
             tools,
             providerOptions,
             skipHeavyPasses,

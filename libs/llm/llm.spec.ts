@@ -291,6 +291,74 @@ describe('LLM.run — agent-loop failover guard', () => {
     });
 });
 
+describe('LLM.run — per-attempt loop tools (toolsForModel)', () => {
+    it("builds each attempt's tools from that attempt's model", async () => {
+        const toolsForModel = jest.fn((modelId: string | undefined) => ({
+            [`tools-for-${modelId}`]: {},
+        }));
+        runAgentLoopCall
+            .mockRejectedValueOnce(authErr())
+            .mockRejectedValueOnce(authErr())
+            .mockResolvedValueOnce('loop-f2');
+
+        const out = await LLM.run({
+            byokConfig: slotWithChain,
+            runName: 'r',
+            messages: [],
+            loop: { tools: { base: {} }, toolsForModel, maxSteps: 5 },
+        } as any);
+
+        expect(out).toBe('loop-f2');
+        expect(toolsForModel.mock.calls.map(([id]) => id)).toEqual([
+            'primary',
+            'f1',
+            'f2',
+        ]);
+        const sent = runAgentLoopCall.mock.calls.map(([p]) => p.loop);
+        expect(sent.map((l) => Object.keys(l.tools))).toEqual([
+            ['tools-for-primary'],
+            ['tools-for-f1'],
+            ['tools-for-f2'],
+        ]);
+        // resolved here, so the executor never sees the seam itself
+        expect(sent.every((l) => !('toolsForModel' in l))).toBe(true);
+    });
+
+    it('passes undefined for the managed default (no slot)', async () => {
+        const toolsForModel = jest.fn(() => ({ managed: {} }));
+        runAgentLoopCall.mockResolvedValueOnce('ok');
+
+        await LLM.run({
+            runName: 'r',
+            messages: [],
+            loop: { tools: {}, toolsForModel, maxSteps: 5 },
+        } as any);
+
+        expect(toolsForModel).toHaveBeenCalledWith(undefined);
+        expect(runAgentLoopCall.mock.calls[0][0].loop.tools).toEqual({
+            managed: {},
+        });
+    });
+
+    it('sends loop.tools unchanged when no toolsForModel is given', async () => {
+        const tools = { t: {} };
+        runAgentLoopCall
+            .mockRejectedValueOnce(authErr())
+            .mockResolvedValueOnce('ok');
+
+        await LLM.run({
+            byokConfig: slotWithFallback,
+            runName: 'r',
+            messages: [],
+            loop: { tools, maxSteps: 5 },
+        } as any);
+
+        expect(
+            runAgentLoopCall.mock.calls.map(([p]) => p.loop.tools),
+        ).toEqual([tools, tools]);
+    });
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // I/O CONTRACT MATRIX (see scratchpad/llm-io-contract-matrix.md).
 //

@@ -141,19 +141,27 @@ function toExecutorParams(
 }
 
 /**
- * Wrap the runner's loop seams so the FIRST emitted step vetoes failover for the
- * current attempt: a step's tool calls mutate shared runner state (its step array
- * + policy progress), so restarting on the fallback would double-count them. The
- * high-value cascade (a bad/expired key, an unknown model) fails BEFORE the first
- * step, so it still fires — this only holds back a rare mid-loop transient.
+ * The runner's loop seams as one attempt runs them.
+ *
+ * - Tools: `toolsForModel`, when the runner supplied it, builds this attempt's
+ *   tool map for its own model, so a chain entry gets tools it can accept.
+ * - Failover guard: the FIRST emitted step vetoes failover for the current
+ *   attempt. A step's tool calls mutate shared runner state (its step array +
+ *   policy progress), so restarting on the fallback would double-count them.
+ *   The high-value cascade (a bad/expired key, an unknown model) fails BEFORE
+ *   the first step, so it still fires — this only holds back a rare mid-loop
+ *   transient.
  */
-function loopWithFailoverGuard(
+function loopForAttempt(
     loop: AgentLoopSeams,
+    attemptSlot: NormalizedModel | undefined,
     control: FailoverAttemptControl,
 ): AgentLoopSeams {
+    const { toolsForModel, ...seams } = loop;
     const inner = loop.onStepFinish;
     return {
-        ...loop,
+        ...seams,
+        tools: toolsForModel ? toolsForModel(attemptSlot?.model) : loop.tools,
         onStepFinish: (event: unknown) => {
             control.markUnsafeToRetry();
             return inner?.(event);
@@ -202,7 +210,7 @@ export class LLM {
                         byokConfig: attemptSlot,
                         system: req.system,
                         messages: req.messages ?? [],
-                        loop: loopWithFailoverGuard(loop, control),
+                        loop: loopForAttempt(loop, attemptSlot, control),
                         runName: req.runName,
                         spanName: req.spanName,
                         attrs: req.attrs,

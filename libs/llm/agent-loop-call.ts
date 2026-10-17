@@ -61,6 +61,14 @@ const AGENT_STEP_MAX_RETRIES = 3;
 export interface AgentLoopSeams {
     /** AI SDK tool map (already converted by the runner). */
     tools: Record<string, unknown>;
+    /** The tool map for the model an attempt runs on, when the tools depend on
+     *  it (the done-tool's `strict` flag: a strict tool built for a Gemini
+     *  primary is rejected by an OpenAI fallback). `LLM.run` calls it once per
+     *  failover attempt with that attempt's model id (undefined for the managed
+     *  default) and sends its result instead of `tools`. Per attempt is safe
+     *  because a cascade only happens before the first step, so every attempt
+     *  starts a fresh loop. */
+    toolsForModel?: (modelId: string | undefined) => Record<string, unknown>;
     /** Hard ceiling on steps — `stepCountIs(maxSteps)` is appended to stopWhen. */
     maxSteps: number;
     /** Extra stop conditions (policy `shouldStop`), OR-ed with the step ceiling. */
