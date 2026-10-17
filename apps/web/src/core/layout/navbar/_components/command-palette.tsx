@@ -35,6 +35,7 @@ import {
     GitPullRequestIcon,
     GlobeIcon,
     KeyRoundIcon,
+    LifeBuoyIcon,
     LockIcon,
     MessageSquareTextIcon,
     PuzzleIcon,
@@ -206,6 +207,12 @@ const PAGES: Array<{
         href: "/organization/notifications",
         icon: BellIcon,
         keywords: "email alerts",
+    },
+    {
+        label: "Organization · Model fallbacks",
+        href: "/organization/model-fallbacks",
+        icon: LifeBuoyIcon,
+        keywords: "fallback chain backup model failover outage byok llm",
     },
 ];
 

@@ -43,6 +43,10 @@ import {
 } from '@libs/organization/application/use-cases/organizationParameters/list-model-overrides.use-case';
 import { ClearModelOverridesUseCase } from '@libs/organization/application/use-cases/organizationParameters/clear-model-overrides.use-case';
 import {
+    SetByokFallbackChainUseCase,
+    SetByokFallbackChainResult,
+} from '@libs/organization/application/use-cases/organizationParameters/byok/set-byok-fallback-chain.use-case';
+import {
     GetCockpitMetricsVisibilityUseCase,
     GET_COCKPIT_METRICS_VISIBILITY_USE_CASE_TOKEN,
 } from '@libs/organization/application/use-cases/organizationParameters/get-cockpit-metrics-visibility.use-case';
@@ -57,6 +61,7 @@ import {
     Get,
     Inject,
     Post,
+    Put,
     Query,
     UseGuards,
 } from '@nestjs/common';
@@ -108,6 +113,9 @@ export class OrganizationParametersController {
 
         @Inject(REQUEST)
         private readonly request: UserRequest,
+
+        // Last, so the positional construction in specs keeps its order.
+        private readonly setByokFallbackChainUseCase: SetByokFallbackChainUseCase,
     ) {}
 
     @Post('/create-or-update')
@@ -343,6 +351,49 @@ export class OrganizationParametersController {
         return await this.deleteByokConfigUseCase.execute(organizationId, {
             modelId,
         });
+    }
+
+    @Put('/byok-fallback-chain')
+    @UseGuards(PolicyGuard)
+    @CheckPolicies(
+        // The same gate as the full BYOK save (POST /create-or-update): this
+        // writes part of the same config.
+        checkPermissions({
+            action: Action.Create,
+            resource: ResourceType.OrganizationSettings,
+        }),
+    )
+    @ApiBody({
+        schema: {
+            type: 'object',
+            required: ['modelIds'],
+            properties: {
+                modelIds: {
+                    type: 'array',
+                    items: { type: 'string' },
+                },
+            },
+            example: { modelIds: ['model-b', 'model-c'] },
+        },
+    })
+    @ApiOperation({
+        summary: 'Set the BYOK fallback chain',
+        description:
+            "Replace the ordered list of BYOK models (`models[]` ids, at most 3) a failed call cascades through. Only the routing's fallback fields change; credentials are never read back or rewritten. An empty list clears the chain. A Kodus-funded model may only be the first entry.",
+    })
+    public async setByokFallbackChain(
+        @Body() body: { modelIds?: unknown },
+    ): Promise<SetByokFallbackChainResult> {
+        const organizationId = this.request?.user?.organization?.uuid;
+        if (!organizationId) {
+            throw new BadRequestException(
+                'Organization ID is missing from request',
+            );
+        }
+        return await this.setByokFallbackChainUseCase.execute(
+            { organizationId },
+            body?.modelIds,
+        );
     }
 
     @Post('/test-byok')

@@ -72,6 +72,7 @@ import {
     GaugeIcon,
     GlobeIcon,
     KeyRoundIcon,
+    LifeBuoyIcon,
     Link2Icon,
     LockIcon,
     MessageSquareTextIcon,
@@ -1210,6 +1211,12 @@ const OrganizationGroup = () => {
             href: "/organization/notifications",
             label: "Notifications",
             icon: BellIcon,
+            visible: canEditOrg,
+        },
+        {
+            href: "/organization/model-fallbacks",
+            label: "Model fallbacks",
+            icon: LifeBuoyIcon,
             visible: canEditOrg,
         },
         {

@@ -11,3 +11,4 @@ export * from './test-byok-connection.use-case';
 export * from './test-byok-model.use-case';
 export * from './list-model-overrides.use-case';
 export * from './clear-model-overrides.use-case';
+export * from './byok/set-byok-fallback-chain.use-case';
