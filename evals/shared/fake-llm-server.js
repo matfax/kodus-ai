@@ -20,7 +20,21 @@
 //
 // It does not try to review anything. It proves the harness can drive the real
 // engine end-to-end; quality is the nightly's job.
+//
+// Faults (`startFakeLlmServer({ fault })`): what a provider in trouble sends
+// instead of an answer, for the failover eval (evals/failover). `fault` is one
+// of FAULT_MODES, or a function of the request body that returns one (or null
+// to answer normally), so one server can fail one model and serve another:
+//   504-html  an HTML 504 "Gateway Timeout" page, as a CDN or proxy sends it
+//   503       a JSON 503 in the OpenAI error shape
+//   429       a JSON 429 rate limit
+//   hang      takes the request and never answers, until the client gives up
+// Every fault carries `retry-after-ms: 0`, so the SDK's same-model retries run
+// at once instead of backing off for seconds; what they decide is unchanged.
 const http = require('http');
+
+const FAULT_MODES = ['504-html', '503', '429', 'hang'];
+const HTML_504 = '<html><head><title>504 Gateway Time-out</title></head><body><center><h1>504 Gateway Time-out</h1></center></body></html>';
 
 const EXPLORATION_PREFERENCE = [/read/i, /grep|search/i, /list|find/i];
 const DONE_TOOL = /^(submit|done|final|finish|report)/i;
@@ -161,8 +175,41 @@ function writeStream(res, completion) {
     res.end('data: [DONE]\n\n');
 }
 
-function startFakeLlmServer({ port = 0, host = '127.0.0.1' } = {}) {
-    const stats = { requests: 0, toolCalls: 0, finals: 0, byPath: {} };
+// Answers with a fault instead of a completion. False for `hang`: the
+// response stays open, and close() ends it.
+function writeFault(res, mode) {
+    const headers = { 'retry-after-ms': '0' };
+    const json = (status, message, type) => {
+        res.writeHead(status, { ...headers, 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { message, type } }));
+    };
+    switch (mode) {
+        case '504-html':
+            res.writeHead(504, 'Gateway Timeout', { ...headers, 'content-type': 'text/html' });
+            res.end(HTML_504);
+            return true;
+        case '503':
+            json(503, 'The server is overloaded or not ready yet.', 'server_error');
+            return true;
+        case '429':
+            json(429, 'Rate limit reached for requests', 'rate_limit_error');
+            return true;
+        case 'hang':
+            return false;
+        default:
+            // A typo in a case, not a provider fault: a 400 nothing retries or
+            // cascades, so the case fails on it.
+            json(400, `fake llm: unknown fault "${mode}" (have: ${FAULT_MODES.join(', ')})`, 'invalid_request_error');
+            return true;
+    }
+}
+
+function startFakeLlmServer({ port = 0, host = '127.0.0.1', fault = null } = {}) {
+    if (typeof fault === 'string' && !FAULT_MODES.includes(fault)) {
+        return Promise.reject(new Error(`fake llm: unknown fault "${fault}" (have: ${FAULT_MODES.join(', ')})`));
+    }
+    const stats = { requests: 0, toolCalls: 0, finals: 0, faults: 0, byPath: {}, byModel: {} };
+    const hanging = new Set();
     let seq = 0;
     const server = http.createServer((req, res) => {
         let raw = '';
@@ -185,7 +232,17 @@ function startFakeLlmServer({ port = 0, host = '127.0.0.1' } = {}) {
                 return;
             }
             stats.requests += 1;
+            stats.byModel[body.model] = (stats.byModel[body.model] || 0) + 1;
             seq += 1;
+            const mode = typeof fault === 'function' ? fault(body) : fault;
+            if (mode) {
+                stats.faults += 1;
+                if (!writeFault(res, mode)) {
+                    hanging.add(res);
+                    res.on('close', () => hanging.delete(res));
+                }
+                return;
+            }
             const decision = decide(body);
             if (decision.tool) stats.toolCalls += 1;
             else stats.finals += 1;
@@ -205,13 +262,17 @@ function startFakeLlmServer({ port = 0, host = '127.0.0.1' } = {}) {
             resolve({
                 url: `http://${host}:${address.port}/v1`,
                 stats,
-                close: () => new Promise((done) => server.close(() => done())),
+                close: () =>
+                    new Promise((done) => {
+                        for (const res of hanging) res.destroy();
+                        server.close(() => done());
+                    }),
             });
         });
     });
 }
 
-module.exports = { startFakeLlmServer, instanceOf, decide };
+module.exports = { startFakeLlmServer, instanceOf, decide, FAULT_MODES };
 
 if (require.main === module) {
     const port = Number(process.env.PORT || 48123);
