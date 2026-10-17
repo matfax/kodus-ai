@@ -50,6 +50,7 @@ engines:
       - "tests/**"
       - "evals/**"
       - "scripts/**"
+      - "package.json"
       - "**/package.json"
   # Synthetic credential corpus for the secret-scanner benchmark.
   trivy:
