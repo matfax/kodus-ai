@@ -82,7 +82,7 @@ const ModelFallbacksEditor = ({
     );
     const pool = useMemo(() => fallbackPool(config), [config]);
     const [chain, setChain] = useState<string[]>(stored);
-    const setFallbackChain = useSetByokFallbackChain();
+    const { save, isSaving } = useSaveFallbackChain(chain);
 
     const isDirty =
         chain.length !== stored.length ||
@@ -100,6 +100,57 @@ const ModelFallbacksEditor = ({
                     "Save the fallback models you changed, or reset them, before leaving this page.",
             }),
     });
+
+    return (
+        <Page.Root>
+            <Page.Header sticky>
+                <Page.TitleContainer>
+                    <Page.Title>Model fallbacks</Page.Title>
+                    <Page.Description>
+                        When a model call fails with an outage, a timeout or an
+                        exhausted rate limit, Kody runs it again on these
+                        models, in this order. Up to {MAX_FALLBACKS}.
+                    </Page.Description>
+                </Page.TitleContainer>
+                <Page.SaveActions
+                    isDirty={isDirty}
+                    isSaving={isSaving}
+                    canSave={canEdit && !problem}
+                    onReset={() => setChain(stored)}
+                    onSave={save}
+                    saveLabel="Save fallbacks"
+                />
+            </Page.Header>
+
+            <Page.Content>
+                <div className="flex w-full max-w-3xl flex-col gap-4">
+                    {pool.length === 0 ? (
+                        <NoModels />
+                    ) : (
+                        <ChainCard
+                            chain={chain}
+                            pool={pool}
+                            problem={problem}
+                            disabled={!canEdit}
+                            onChange={setChain}
+                        />
+                    )}
+
+                    <p className="text-text-tertiary text-xs">
+                        The routing tab on{" "}
+                        <Link href="/byok?tab=routing">AI providers</Link> shows
+                        the first fallback. Turning the fallback off there
+                        clears this whole list.
+                    </p>
+                </div>
+            </Page.Content>
+        </Page.Root>
+    );
+};
+
+/** Saves `chain` and reports the outcome in a toast. */
+const useSaveFallbackChain = (chain: string[]) => {
+    const setFallbackChain = useSetByokFallbackChain();
 
     const save = async () => {
         try {
@@ -122,103 +173,66 @@ const ModelFallbacksEditor = ({
         }
     };
 
-    const addable = pool.filter((model) => !chain.includes(model.id));
-
-    return (
-        <Page.Root>
-            <Page.Header sticky>
-                <Page.TitleContainer>
-                    <Page.Title>Model fallbacks</Page.Title>
-                    <Page.Description>
-                        When a model call fails with an outage, a timeout or an
-                        exhausted rate limit, Kody runs it again on these
-                        models, in this order. Up to {MAX_FALLBACKS}.
-                    </Page.Description>
-                </Page.TitleContainer>
-                <Page.SaveActions
-                    isDirty={isDirty}
-                    isSaving={setFallbackChain.isPending}
-                    canSave={canEdit && !problem}
-                    onReset={() => setChain(stored)}
-                    onSave={save}
-                    saveLabel="Save fallbacks"
-                />
-            </Page.Header>
-
-            <Page.Content>
-                <div className="flex w-full max-w-3xl flex-col gap-4">
-                    {pool.length === 0 ? (
-                        <NoModels />
-                    ) : (
-                        <Card color="lv1">
-                            <CardContent className="flex flex-col gap-4 pt-6">
-                                {chain.length === 0 ? (
-                                    <p className="text-text-secondary text-sm">
-                                        No fallback models. A call that fails is
-                                        not retried on another model.
-                                    </p>
-                                ) : (
-                                    <ol className="flex flex-col gap-2">
-                                        {chain.map((id, index) => (
-                                            <ChainEntry
-                                                key={id}
-                                                id={id}
-                                                index={index}
-                                                count={chain.length}
-                                                model={pool.find(
-                                                    (m) => m.id === id,
-                                                )}
-                                                disabled={!canEdit}
-                                                onMove={(offset) =>
-                                                    setChain(
-                                                        moveEntry(
-                                                            chain,
-                                                            index,
-                                                            offset,
-                                                        ),
-                                                    )
-                                                }
-                                                onRemove={() =>
-                                                    setChain(
-                                                        chain.filter(
-                                                            (entry) =>
-                                                                entry !== id,
-                                                        ),
-                                                    )
-                                                }
-                                            />
-                                        ))}
-                                    </ol>
-                                )}
-
-                                {problem && (
-                                    <p className="text-danger flex items-center gap-2 text-sm">
-                                        <TriangleAlertIcon className="size-4 shrink-0" />
-                                        {problem}
-                                    </p>
-                                )}
-
-                                <AddEntry
-                                    options={addable}
-                                    chainLength={chain.length}
-                                    disabled={!canEdit}
-                                    onAdd={(id) => setChain([...chain, id])}
-                                />
-                            </CardContent>
-                        </Card>
-                    )}
-
-                    <p className="text-text-tertiary text-xs">
-                        The routing tab on{" "}
-                        <Link href="/byok?tab=routing">AI providers</Link> shows
-                        the first fallback. Turning the fallback off there
-                        clears this whole list.
-                    </p>
-                </div>
-            </Page.Content>
-        </Page.Root>
-    );
+    return { save, isSaving: setFallbackChain.isPending };
 };
+
+const ChainCard = ({
+    chain,
+    pool,
+    problem,
+    disabled,
+    onChange,
+}: {
+    chain: string[];
+    pool: FallbackPoolModel[];
+    problem: string | null | undefined;
+    disabled: boolean;
+    onChange: (chain: string[]) => void;
+}) => (
+    <Card color="lv1">
+        <CardContent className="flex flex-col gap-4 pt-6">
+            {chain.length === 0 ? (
+                <p className="text-text-secondary text-sm">
+                    No fallback models. A call that fails is not retried on
+                    another model.
+                </p>
+            ) : (
+                <ol className="flex flex-col gap-2">
+                    {chain.map((id, index) => (
+                        <ChainEntry
+                            key={id}
+                            id={id}
+                            index={index}
+                            count={chain.length}
+                            model={pool.find((m) => m.id === id)}
+                            disabled={disabled}
+                            onMove={(offset) =>
+                                onChange(moveEntry(chain, index, offset))
+                            }
+                            onRemove={() =>
+                                onChange(chain.filter((entry) => entry !== id))
+                            }
+                        />
+                    ))}
+                </ol>
+            )}
+
+            {problem && (
+                <p className="text-danger flex items-center gap-2 text-sm">
+                    <TriangleAlertIcon className="size-4 shrink-0" />
+                    {problem}
+                </p>
+            )}
+
+            <AddEntry
+                options={pool.filter((model) => !chain.includes(model.id))}
+                chainLength={chain.length}
+                disabled={disabled}
+                onAdd={(id) => onChange([...chain, id])}
+            />
+        </CardContent>
+    </Card>
+);
 
 const ChainEntry = ({
     id,
