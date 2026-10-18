@@ -198,7 +198,7 @@ const CASES = [
     },
     {
         id: 'midloop-hang',
-        checks: 'Moves a finder run whose primary stalls after two steps to the fallback at the round-trip deadline, which continues the run instead of starting over: it keeps the finding the primary reported and is told what was reported and what is still unread',
+        checks: 'Continues a finder run on the fallback at the deadline when its primary stalls after two steps, keeping its report and handing over what is still unread',
         fault: after(2, 'hang'),
         run: async (ctx) => {
             const r = await ctx.review('midloop-hang', { chain: [{ id: 'midloop-hang-backup', fault: null }] });
