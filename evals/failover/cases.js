@@ -15,9 +15,15 @@
 //   call(id, { signal, chain })  one LLM.run loop call routed to the case's
 //                                primary; resolves { value, error, failovers,
 //                                hops, answeredBy, ms, primaryRequests }
+//   review(id, { chain, env, healthy })
+//                                one finder run (real spec, real runner)
+//                                routed to the case's primary; resolves
+//                                { state, findings, hops, answeredBy, ms,
+//                                primaryRequests }
+//   bodiesOf(id)                 the request bodies a faulty-server model got
 //   setFault(id, fault)          change what the primary answers from now on
 //   circuitState(id)             the breaker state of the case's primary
-//   sleep(ms), DEADLINE_MS, OPEN_MS
+//   sleep(ms), DEADLINE_MS, OPEN_MS, UNREAD, REVIEW_MAX_STEPS
 const hop = (h, outcome, reason) => !!h && h.outcome === outcome && h.reason === reason;
 const hopsText = (hops) => (hops.length ? hops.map((h) => `${h.model} ${h.outcome} (${h.reason})`).join(', ') : 'none');
 
@@ -30,6 +36,20 @@ function completedOn(r, who) {
         ok: !r.error && r.answeredBy === who && steps >= 2,
     };
 }
+
+// A primary that answers its first `steps` requests (a finder run's readFile,
+// then reportFinding), then fails with `mode`.
+const after = (steps, mode) => (n) => (n <= steps ? null : mode);
+
+// The finder run finished on a fallback, without an error.
+function reviewCompletedOnFallback(r) {
+    return {
+        what: `the run completes on a fallback (status ${r.state.status}, answered by ${r.answeredBy ?? 'nobody'})`,
+        ok: r.state.status !== 'error' && !!r.answeredBy && r.answeredBy !== 'primary',
+    };
+}
+
+const reportsOf = (r) => r.state.artifacts.filter((a) => a.type === 'reportFinding');
 
 const CASES = [
     {
@@ -174,6 +194,66 @@ const CASES = [
             detail.push(completedOn(recovered, 'primary'));
             detail.push({ what: `a probe the primary answers closes its circuit (${ctx.circuitState('circuit')})`, ok: ctx.circuitState('circuit') === 'closed' });
             return { detail, measures: { openCircuitRequests: skipped.primaryRequests } };
+        },
+    },
+    {
+        id: 'midloop-hang',
+        checks: 'Moves a finder run whose primary stalls after two steps to the fallback at the round-trip deadline, which continues the run instead of starting over: it keeps the finding the primary reported and is told what was reported and what is still unread',
+        fault: after(2, 'hang'),
+        run: async (ctx) => {
+            const r = await ctx.review('midloop-hang', { chain: [{ id: 'midloop-hang-backup', fault: null }] });
+            const handover = JSON.stringify(ctx.bodiesOf('midloop-hang-backup')[0]?.messages ?? []);
+            const reports = reportsOf(r);
+            const limit = ctx.DEADLINE_MS + 2000;
+            const detail = [
+                reviewCompletedOnFallback(r),
+                { what: `the primary's hop is failed (deadline) and continued (hops: ${hopsText(r.hops)}, continued: ${r.hops[0]?.continued})`, ok: r.hops.length === 1 && hop(r.hops[0], 'failed', 'deadline') && r.hops[0].continued === true },
+                { what: `the primary's report is kept and the fallback's added (reports at ${reports.map((a) => a.location).join(', ') || 'none'})`, ok: reports.length === 2 && reports[0].location === 'step:1' },
+                { what: `the run stays within its step budget (${r.state.steps.length} of ${ctx.REVIEW_MAX_STEPS})`, ok: r.state.steps.length <= ctx.REVIEW_MAX_STEPS },
+                { what: 'the fallback is handed the findings already reported', ok: handover.includes('Findings already reported') },
+                { what: 'and the code still unread', ok: handover.includes(ctx.UNREAD) },
+                { what: `the run ends within the deadline + 2s (${r.ms} ms, limit ${limit} ms)`, ok: r.ms <= limit },
+            ];
+            return { detail, measures: { midLoopStallGiveUpMs: r.hops[0]?.elapsedMs ?? null } };
+        },
+    },
+    {
+        id: 'midloop-503',
+        checks: 'Continues a finder run on the fallback when its primary keeps answering 503 after two steps, once the same-model retries are spent',
+        fault: after(2, '503'),
+        run: async (ctx) => {
+            const r = await ctx.review('midloop-503', { chain: [{ id: 'midloop-503-backup', fault: null }] });
+            return [
+                reviewCompletedOnFallback(r),
+                { what: `the primary's hop is failed (TRANSIENT) and continued (hops: ${hopsText(r.hops)})`, ok: r.hops.length === 1 && hop(r.hops[0], 'failed', 'TRANSIENT') && r.hops[0].continued === true },
+                { what: `the 503 is retried on the primary first (${r.primaryRequests} requests)`, ok: r.primaryRequests > 3 },
+                { what: `both models' reports are in the run (${reportsOf(r).length})`, ok: reportsOf(r).length === 2 },
+            ];
+        },
+    },
+    {
+        id: 'midloop-all-fail',
+        checks: 'Keeps the finding a finder run reported when its primary fails after two steps and the only fallback fails too',
+        fault: after(2, '503'),
+        run: async (ctx) => {
+            const r = await ctx.review('midloop-all-fail', { chain: [{ id: 'midloop-all-fail-backup', fault: '503' }], healthy: false });
+            return [
+                { what: `the run ends in an error (status ${r.state.status})`, ok: r.state.status === 'error' },
+                { what: `the fallback was asked (${ctx.requestsOf('midloop-all-fail-backup')} requests)`, ok: ctx.requestsOf('midloop-all-fail-backup') > 0 },
+                { what: `the reported finding is kept (${r.findings.length} findings)`, ok: r.findings.length === 1 },
+            ];
+        },
+    },
+    {
+        id: 'midloop-switch-off',
+        checks: 'With LLM_LOOP_CONTINUE=off, ends a finder run whose primary fails after two steps without asking the fallback, as before continuation existed',
+        fault: after(2, '503'),
+        run: async (ctx) => {
+            const r = await ctx.review('midloop-switch-off', { chain: [{ id: 'midloop-switch-off-backup', fault: null }], env: { LLM_LOOP_CONTINUE: 'off' } });
+            return [
+                { what: `the run ends in an error (status ${r.state.status})`, ok: r.state.status === 'error' },
+                { what: `the fallback is never asked (${ctx.requestsOf('midloop-switch-off-backup')} requests)`, ok: ctx.requestsOf('midloop-switch-off-backup') === 0 },
+            ];
         },
     },
 ];

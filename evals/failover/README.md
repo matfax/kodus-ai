@@ -7,7 +7,9 @@
 > - **Cost:** none: two local fake servers, no key. About 10 seconds, most of it the circuit case waiting out its open periods.
 
 The eval runs `LLM.run` in agent-loop mode, the path the finder and the
-verifier take, for an org whose stored BYOK config holds a fallback chain:
+verifier take, and, for the `midloop-*` cases, a whole finder run (the real
+finder spec on `AiSdkAgentRunner`, with `reportFinding` and the hand-over to a
+fallback), for an org whose stored BYOK config holds a fallback chain:
 production routing (`libs/llm/resolve-task-model.ts`) stamps the chain on the
 slot, and the cascade (`libs/llm/model-failover.ts`), the circuit breaker
 (`libs/llm/provider-circuit.ts`), the round-trip deadline
@@ -27,7 +29,8 @@ primary model, because the breaker keeps its state per model in memory.
 The runner sets the knobs the cases depend on (`ENV` in `evals/failover/run.js`),
 so a change to their defaults does not move the eval: the provider-timeout
 cascade on, a 1s round-trip deadline, the breaker in `enforce` mode, opened by
-one counted failure, and a 1s open period.
+one counted failure, a 1s open period, and mid-loop continuation on. A finder
+run gets a 5s caller budget, so a stall it cannot move past ends in seconds.
 
 ## What it measures
 
@@ -39,11 +42,14 @@ against its baseline from before the fallback chain:
 | Share of HTML 504 "Gateway Timeout" faults that cascade (`504-html`, `html504Cascaded`) | 0%: the status phrase read as a caller timeout and stopped the cascade | 100% |
 | Time to give up on a primary that hangs before its first step (`hang`, `hungPrimaryGiveUpMs`) | about 80 min in a loop (undici's 20 min bound on each of the 4 SDK attempts), 20 min one-shot | the deadline, plus under 2s |
 | Requests to a model with an open circuit on the next call (`circuit`, `openCircuitRequests`) | every call: there was no breaker | 0 |
+| Time to give up on a primary that stalls after a finder run's first steps (`midloop-hang`, `midLoopStallGiveUpMs`) | 80 min (`AGENT_TIMEOUT_MS`): the deadline switched off once a step had run, and the run then failed with nothing kept | the deadline, and the fallback finishes the run |
 
 Setting `LLM_PROVIDER_TIMEOUT_CASCADE` to `off` in `ENV` (`evals/failover/run.js`)
 restores the old timeout gate: the `504-html` and `chain` cases then fail,
 which is the 0% above. With `LLM_CIRCUIT_MODE` at `shadow` the `circuit` case
-fails instead.
+fails instead. With `LLM_LOOP_CONTINUE` at `off`, `midloop-hang`,
+`midloop-503` and `midloop-all-fail` fail (40/50): the run ends at the first
+mid-loop failure and no fallback is asked.
 
 A failed check names what it saw (the hops, the request count, the time), so
 the line in the output is the diagnosis.
