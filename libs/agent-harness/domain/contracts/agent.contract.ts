@@ -8,7 +8,7 @@
  */
 
 import type { AgentPolicy } from './policy.contract';
-import type { RunState } from './run-state.contract';
+import type { Artifact, RunState, RunStep } from './run-state.contract';
 import type { AgentTool, ToolContext, ToolRegistry } from './tool.contract';
 
 /** Declarative configuration of an agent role. Pure data — swap prompt or
@@ -56,6 +56,39 @@ export interface AgentSpec {
      *  by a policy (e.g. CompletionGatePolicy.doneToolName) — same tool,
      *  distinct roles. */
     readonly resultToolName?: string;
+    /** Other tools whose calls are captured into `RunState.artifacts` the same
+     *  way, in step order, for a run that reports results as it goes (e.g. a
+     *  non-terminal `reportFinding` next to the final `submitResult`). They do
+     *  not stop the run. */
+    readonly reportToolNames?: readonly string[];
+    /**
+     * What happens when the model call fails after the run has taken steps
+     * and the org has a fallback model to move to:
+     * - `'continue'`: the fallback picks up the run. It gets the opening
+     *   messages plus a hand-over turn (`continuation`), the steps left, and
+     *   the run keeps its steps and artifacts.
+     * - `'restart'`: the fallback runs the task again from the opening
+     *   messages; the failed attempt's steps are dropped.
+     * Unset: the run ends with an error, as it always has. Only set it for an
+     * agent whose tools have no external side effects, since the fallback
+     * redoes some or all of the work.
+     */
+    readonly onFailover?: 'continue' | 'restart';
+    /** The hand-over turn for a `'continue'` run. Unset → a generic note that
+     *  lists the tool calls made so far. */
+    readonly continuation?: (progress: ContinuationProgress) => string;
+}
+
+/** What a `'continue'` run's hand-over turn is built from. */
+export interface ContinuationProgress {
+    /** Every step taken so far, on every model. */
+    readonly steps: readonly RunStep[];
+    /** The artifacts captured from those steps. */
+    readonly artifacts: readonly Artifact[];
+    /** The steps the fallback may take. */
+    readonly stepsLeft: number;
+    readonly failedModel: string;
+    readonly nextModel: string;
 }
 
 /** The single agent loop. The ENTIRE harness has exactly one of these.

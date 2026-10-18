@@ -16,13 +16,16 @@
  */
 import { jsonSchema, tool as aiTool, type ModelMessage } from 'ai';
 import { LLM, type AgentLoopResult } from '@libs/llm/llm';
+import type { AgentLoopLeg } from '@libs/llm/agent-loop-call';
 import { readAiSdkUsage } from '@libs/llm/ai-sdk-usage';
 import type { NormalizedModel } from '@libs/llm/byok-config';
+import type { ResumeInfo } from '@libs/llm/model-failover';
 
 import type {
     AgentRunInput,
     AgentRunner,
     AgentSpec,
+    ContinuationProgress,
 } from '../../domain/contracts/agent.contract';
 import type {
     AgentPolicy,
@@ -80,12 +83,18 @@ export class AiSdkAgentRunner implements AgentRunner {
         const toolsForModel = spec.toolsForModel;
 
         // --- seed messages ---
-        const messages: ModelMessage[] = sanitizeNoSystem([
+        const seed: ModelMessage[] = sanitizeNoSystem([
             ...(input.seedMessages ?? []).map(
                 (m) => ({ role: m.role, content: m.content }) as ModelMessage,
             ),
             { role: 'user', content: input.prompt },
         ]);
+        // The conversation the current attempt started from: the seed, or the
+        // seed plus a hand-over turn once a fallback continues the run.
+        let messages = seed;
+        // Steps run by earlier attempts, so the policies count the whole run
+        // (the SDK numbers each attempt's steps from 0).
+        let stepOffset = 0;
 
         const buildView = (
             stepNumber: number,
@@ -116,7 +125,7 @@ export class AiSdkAgentRunner implements AgentRunner {
         // shouldStop: stop if ANY policy says so (LLM.run appends stepCountIs).
         const policyStopWhen = async ({ steps: aiSteps }: any) => {
             const view = buildView(
-                aiSteps?.length ?? 0,
+                stepOffset + (aiSteps?.length ?? 0),
                 messages,
                 allToolNames,
             );
@@ -138,7 +147,11 @@ export class AiSdkAgentRunner implements AgentRunner {
             messages: msgs,
         }: any) => {
             const active = [...allToolNames];
-            const view = buildView(stepNumber, msgs ?? messages, active);
+            const view = buildView(
+                stepOffset + stepNumber,
+                msgs ?? messages,
+                active,
+            );
             const merged = await this.mergeDirectives(spec.policies, view, emit);
             const out: Record<string, unknown> = {};
 
@@ -222,6 +235,54 @@ export class AiSdkAgentRunner implements AgentRunner {
             | { pullRequestId?: number; teamId?: string }
             | undefined;
 
+        // Failover after steps ran: LLM.run asks for the next attempt's leg.
+        const continueFrom = spec.onFailover
+            ? (info: ResumeInfo): AgentLoopLeg => {
+                  emit('runner', {
+                      kind: 'failover.continue',
+                      detail: {
+                          mode: spec.onFailover,
+                          from: info.failedModel,
+                          to: info.nextModel,
+                          reason: info.reason,
+                          step: steps.length,
+                      },
+                  });
+                  if (spec.onFailover === 'restart') {
+                      steps.length = 0;
+                      stepOffset = 0;
+                      messages = seed;
+                      return { messages: seed, maxSteps: spec.maxSteps };
+                  }
+                  const stepsLeft = Math.max(
+                      spec.maxSteps - steps.length,
+                      MIN_CONTINUATION_STEPS,
+                  );
+                  const progress: ContinuationProgress = {
+                      steps,
+                      artifacts: materializeArtifacts(
+                          steps,
+                          artifactToolNames(spec),
+                          'continuation',
+                      ),
+                      stepsLeft,
+                      failedModel: info.failedModel,
+                      nextModel: info.nextModel,
+                  };
+                  messages = [
+                      ...seed,
+                      {
+                          role: 'user',
+                          content:
+                              spec.continuation?.(progress) ??
+                              genericContinuation(progress),
+                      },
+                  ];
+                  stepOffset = steps.length;
+                  return { messages, maxSteps: stepsLeft };
+              }
+            : undefined;
+
         try {
             // ── the model call: ONE door. LLM.run resolves the slot → model +
             // tuning + reasoning + prompt-cache, runs the loop from these seams,
@@ -295,6 +356,7 @@ export class AiSdkAgentRunner implements AgentRunner {
                     stopWhen: [policyStopWhen],
                     prepareStep: policyPrepareStep,
                     onStepFinish: stepCollector,
+                    ...(continueFrom ? { continueFrom } : {}),
                 },
             });
         } catch (err) {
@@ -356,7 +418,7 @@ export class AiSdkAgentRunner implements AgentRunner {
                 steps,
                 artifacts: materializeArtifacts(
                     steps,
-                    spec.resultToolName,
+                    artifactToolNames(spec),
                     'error',
                 ),
                 stopReason: 'error',
@@ -385,11 +447,18 @@ export class AiSdkAgentRunner implements AgentRunner {
             // here so the domain reads state.artifacts, never re-scans steps.
             artifacts: materializeArtifacts(
                 steps,
-                spec.resultToolName,
+                artifactToolNames(spec),
                 stopReason ?? 'result',
             ),
             stopReason,
-            usage: readAiSdkUsage(result.usage),
+            // A continued run: the last attempt's SDK total covers only its
+            // own steps, so the earlier attempts' steps are added to it.
+            usage: stepOffset
+                ? sumUsage(
+                      aggregateUsage(steps.slice(0, stepOffset)),
+                      readAiSdkUsage(result.usage),
+                  )
+                : readAiSdkUsage(result.usage),
             trace,
         };
     }
@@ -528,17 +597,52 @@ function sanitizeNoSystem(messages: ModelMessage[]): ModelMessage[] {
     );
 }
 
-/** Materialize the "result tool" convention: every call to spec.resultToolName
- *  becomes an Artifact, in step order, so the LAST one is the run's final
- *  structured output. The domain reads RunState.artifacts instead of re-scanning
- *  steps by hand — this is the gap the Artifact type promised but never filled.
- *  No resultToolName (or no matching call) -> [] (honest: nothing to capture). */
+/** A continuation always gets enough steps to finalize (ForceFinalize's window). */
+const MIN_CONTINUATION_STEPS = 3;
+
+/** The tools whose calls become artifacts: the result tool, then the report
+ *  tools. */
+function artifactToolNames(spec: AgentSpec): readonly string[] {
+    return [
+        ...(spec.resultToolName ? [spec.resultToolName] : []),
+        ...(spec.reportToolNames ?? []),
+    ];
+}
+
+/** Longest tool input quoted in the generic hand-over note. */
+const CONTINUATION_INPUT_CHARS = 160;
+
+/** The hand-over turn when the spec has no `continuation` of its own: what was
+ *  done so far, so the fallback does not start over. */
+function genericContinuation(progress: ContinuationProgress): string {
+    const calls = progress.steps.flatMap((s) =>
+        (s.message.toolCalls ?? []).map((tc) => {
+            const input = JSON.stringify(tc.input ?? {});
+            const shown =
+                input.length > CONTINUATION_INPUT_CHARS
+                    ? `${input.slice(0, CONTINUATION_INPUT_CHARS)}...`
+                    : input;
+            return `- ${tc.name} ${shown}`;
+        }),
+    );
+    return [
+        `The model working on this task stopped after ${progress.steps.length} steps. You are taking over: continue the task from where it stopped, without repeating finished work. You have ${progress.stepsLeft} steps.`,
+        ...(calls.length ? ['', 'Tool calls made so far:', ...calls] : []),
+    ].join('\n');
+}
+
+/** Materialize the "result tool" convention: every call to one of `toolNames`
+ *  (the result tool and any report tools) becomes an Artifact, in step order,
+ *  so the LAST result-tool artifact is the run's final structured output. The
+ *  domain reads RunState.artifacts instead of re-scanning steps by hand — this
+ *  is the gap the Artifact type promised but never filled. No names (or no
+ *  matching call) -> [] (honest: nothing to capture). */
 function materializeArtifacts(
     steps: readonly RunStep[],
-    resultToolName: string | undefined,
+    toolNames: readonly string[],
     stage: string,
 ): Artifact[] {
-    if (!resultToolName) {
+    if (!toolNames.length) {
         return [];
     }
 
@@ -546,11 +650,11 @@ function materializeArtifacts(
 
     for (const s of steps) {
         for (const tc of s.message.toolCalls ?? []) {
-            if (tc.name !== resultToolName) {
+            if (!toolNames.includes(tc.name)) {
                 continue;
             }
             artifacts.push({
-                type: resultToolName,
+                type: tc.name,
                 payload: parseArtifactInput(tc.input),
                 location: `step:${s.index}`,
                 stage,
@@ -578,6 +682,18 @@ function parseArtifactInput(input: unknown): unknown {
 // (the duplication that dropped cache tokens). Re-exported here (it is imported
 // above for internal use) for back-compat with existing importers.
 export { readAiSdkUsage };
+
+function sumUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
+    const add = (x?: number, y?: number) =>
+        x === undefined && y === undefined ? undefined : (x ?? 0) + (y ?? 0);
+    return {
+        inputTokens: add(a.inputTokens, b.inputTokens),
+        outputTokens: add(a.outputTokens, b.outputTokens),
+        reasoningTokens: add(a.reasoningTokens, b.reasoningTokens),
+        cacheReadTokens: add(a.cacheReadTokens, b.cacheReadTokens),
+        cacheWriteTokens: add(a.cacheWriteTokens, b.cacheWriteTokens),
+    };
+}
 
 /** Best-effort token usage from the steps collected before a failure —
  *  the error path has no provider-level total to read. */

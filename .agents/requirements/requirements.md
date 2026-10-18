@@ -20,4 +20,4 @@
 - [ ] `R14` All requirements with subjects related to the PR are checked on each PR. `+requirements-tracking` `+pr-review` `2026-10-09`
 - [ ] `R15` The issues discussed in the UI are the Kodus issues that remain open after a PR, listed at repo level. `+issues` `2026-10-09`
 - [x] `R16` Model fallback is graceful and reliable, so Claude can serve as another provider. `+llm-provider` `+claude-sdk` `2026-10-16 → met 2026-10-18: confirmed by the user before a commit`
-- [ ] `R17` When an agent loop fails partway, findings are saved as they are reported, so a run that moves to the backup model keeps the findings already made and finishes the rest instead of restarting. `+agent` `+llm-provider` `+pr-review` `2026-10-18`
+- [x] `R17` When an agent loop fails partway, findings are saved as they are reported, so a run that moves to the backup model keeps the findings already made and finishes the rest instead of restarting. `+agent` `+llm-provider` `+pr-review` `2026-10-18 → met 2026-10-18: confirmed by the user before a commit`
