@@ -65,7 +65,8 @@ export interface AgentSpec {
      * What happens when the model call fails after the run has taken steps
      * and the org has a fallback model to move to:
      * - `'continue'`: the fallback picks up the run. It gets the opening
-     *   messages plus a hand-over turn (`continuation`), the steps left, and
+     *   messages plus a hand-over turn (`continuation`), the steps left
+     *   (never more than `maxSteps` in all; none left ends the run), and
      *   the run keeps its steps and artifacts.
      * - `'restart'`: the fallback runs the task again from the opening
      *   messages; the failed attempt's steps are dropped.

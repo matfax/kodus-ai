@@ -204,7 +204,7 @@ describe('AiSdkAgentRunner — failover after steps ran', () => {
             expect(seen).toEqual([3, 4]);
         });
 
-        it('always leaves the backup enough steps to finalize', async () => {
+        it('never gives the backup more than the steps left', async () => {
             const { leg } = await play({
                 spec: spec({
                     onFailover: 'continue',
@@ -214,7 +214,22 @@ describe('AiSdkAgentRunner — failover after steps ran', () => {
                 leg1: [step('readFile'), step('readFile'), step('readFile')],
                 leg2: [step('submitResult')],
             });
-            expect(leg?.maxSteps).toBe(3);
+            expect(leg?.maxSteps).toBe(1);
+        });
+
+        it('ends the run when the failed attempt used the whole budget, keeping its reports', async () => {
+            const { state, leg } = await play({
+                spec: spec({
+                    onFailover: 'continue',
+                    continuation: () => 'go on',
+                    maxSteps: 2,
+                }),
+                leg1: [step('readFile'), step('reportFinding', { title: 'f1' })],
+                leg2: [step('submitResult')],
+            });
+            expect(leg).toBeUndefined();
+            expect(state.status).toBe('error');
+            expect(state.artifacts.map((a) => a.type)).toEqual(['reportFinding']);
         });
 
         it('falls back to a note listing the tool calls when the spec has no continuation', async () => {

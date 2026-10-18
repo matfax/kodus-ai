@@ -236,8 +236,9 @@ export class AiSdkAgentRunner implements AgentRunner {
             | undefined;
 
         // Failover after steps ran: LLM.run asks for the next attempt's leg.
+        // Undefined ends the run: a 'continue' run with no steps left.
         const continueFrom = spec.onFailover
-            ? (info: ResumeInfo): AgentLoopLeg => {
+            ? (info: ResumeInfo): AgentLoopLeg | undefined => {
                   emit('runner', {
                       kind: 'failover.continue',
                       detail: {
@@ -254,10 +255,12 @@ export class AiSdkAgentRunner implements AgentRunner {
                       messages = seed;
                       return { messages: seed, maxSteps: spec.maxSteps };
                   }
-                  const stepsLeft = Math.max(
-                      spec.maxSteps - steps.length,
-                      MIN_CONTINUATION_STEPS,
-                  );
+                  // Never past the spec's ceiling: the fallback gets what the
+                  // failed attempt left, and nothing when it used it all.
+                  const stepsLeft = spec.maxSteps - steps.length;
+                  if (stepsLeft <= 0) {
+                      return undefined;
+                  }
                   const progress: ContinuationProgress = {
                       steps,
                       artifacts: materializeArtifacts(
@@ -596,9 +599,6 @@ function sanitizeNoSystem(messages: ModelMessage[]): ModelMessage[] {
         m.role === 'system' ? ({ ...m, role: 'user' } as ModelMessage) : m,
     );
 }
-
-/** A continuation always gets enough steps to finalize (ForceFinalize's window). */
-const MIN_CONTINUATION_STEPS = 3;
 
 /** The tools whose calls become artifacts: the result tool, then the report
  *  tools. */
