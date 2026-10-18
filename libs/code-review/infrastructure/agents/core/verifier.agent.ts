@@ -127,6 +127,9 @@ export function buildVerifierAgentSpec(
         // CAPTURE: the runner materializes submitVerdict's payload into
         // RunState.artifacts — extractVerdict reads that, never re-scans steps.
         resultToolName: VERIFY_DONE_TOOL,
+        // A verification is a few read-only steps: a fallback runs it again
+        // from the start rather than picking it up.
+        onFailover: 'restart',
         providerOptions: params.providerOptions,
     };
 }

@@ -129,7 +129,8 @@ export type ReviewWarningKind =
     | "SANDBOX_UNAVAILABLE"
     | "CALLGRAPH_FAILED"
     | "SUGGESTIONS_DROPPED_PATH_MISMATCH"
-    | "KODY_RULES_PARTIAL";
+    | "KODY_RULES_PARTIAL"
+    | "REVIEW_INCOMPLETE";
 
 export interface ReviewWarning {
     kind: ReviewWarningKind;

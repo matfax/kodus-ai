@@ -1,6 +1,7 @@
 import {
     dedupReviewWarnings,
     buildProviderFallbackWarning,
+    buildReviewIncompleteWarning,
     buildRuleContextUnavailableWarning,
     buildBadFixDowngradedWarning,
     buildCallGraphFailedWarning,
@@ -101,6 +102,28 @@ describe('buildProviderFallbackWarning', () => {
         expect(warning.contextWindowTokens).toBe(0);
     });
 
+    it('says the fallback finished the review when the main model failed partway', () => {
+        const [warning] = withFallbackWarnings(undefined, [
+            {
+                failedModel: 'main',
+                usedModel: 'fb',
+                hops: [
+                    {
+                        model: 'main',
+                        chainIndex: 0,
+                        outcome: 'failed',
+                        reason: 'deadline',
+                        elapsedMs: 300_000,
+                        continued: true,
+                    },
+                ],
+            },
+        ])!;
+        expect(warning.detail).toBe(
+            'main provider main failed partway; fallback fb finished the review',
+        );
+    });
+
     it('says the main model was skipped when its circuit breaker was open', () => {
         const [warning] = withFallbackWarnings(undefined, [
             {
@@ -144,6 +167,27 @@ describe('buildProviderFallbackWarning', () => {
         expect(out).toHaveLength(1);
         expect(out[0].kind).toBe('PROVIDER_FALLBACK');
         expect(out[0].agentName).toBeUndefined();
+    });
+});
+
+describe('buildReviewIncompleteWarning', () => {
+    it('names the agent, the steps, the error and how many findings were kept', () => {
+        expect(
+            buildReviewIncompleteWarning({
+                modelName: 'm',
+                agentName: 'bug',
+                kept: 2,
+                steps: 9,
+                error: 'Gateway Timeout',
+            }),
+        ).toEqual({
+            kind: 'REVIEW_INCOMPLETE',
+            reason: 'provider_failover',
+            contextWindowTokens: 0,
+            modelName: 'm',
+            agentName: 'bug',
+            detail: 'bug: every model failed after 9 steps (Gateway Timeout); kept the 2 finding(s) reported before that',
+        });
     });
 });
 

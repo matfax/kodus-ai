@@ -91,6 +91,13 @@ const LOSSES: Record<string, Loss> = {
         impact: 'Those reviews ran on a different model, with different cost and quality.',
         fix: "Check the main model's key, quota and model name in the BYOK page (user menu > BYOK).",
     },
+    'reviews.incomplete': {
+        matches: kind('REVIEW_INCOMPLETE'),
+        title: (n, t) =>
+            `${n} of ${t} reviews stopped partway because every model failed; the findings found until then were posted.`,
+        impact: 'Part of those pull requests was not reviewed.',
+        fix: 'Add a fallback model on a different provider (Model fallbacks page), and check the failing models in the BYOK page (user menu > BYOK).',
+    },
     'reviews.context_window': {
         matches: (run) =>
             run.warningKinds.some((k) => CONTEXT_WINDOW_KINDS.has(k)),

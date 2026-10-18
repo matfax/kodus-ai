@@ -12,6 +12,7 @@
 import type {
     AgentRunner,
     AgentSpec,
+    ContinuationProgress,
 } from '@libs/agent-harness/domain/contracts/agent.contract';
 import { TITLE_PROMPT_SPEC } from '@libs/common/utils/codeManagement/suggestion-title';
 import type { Compressor } from '@libs/agent-harness/domain/contracts/compression.contract';
@@ -58,6 +59,8 @@ import type { NormalizedModel } from '@libs/llm/byok-config';
 import { z } from 'zod';
 
 export const FINDER_DONE_TOOL = 'submitResult' as const;
+/** The non-terminal tool the finder records each confirmed finding with. */
+export const FINDER_REPORT_TOOL = 'reportFinding' as const;
 
 const finderLogger = createLogger('finder');
 
@@ -86,52 +89,53 @@ export interface FinderSuggestion {
     revisesSuggestionId?: string;
 }
 
-/** JSON schema for submitResult — mirrors the legacy _findingsSchema. */
-const SUBMIT_RESULT_SCHEMA: JSONSchema = {
+/** JSON schema for ONE finding — the submitResult item and the reportFinding
+ *  input. Mirrors the legacy _findingsSchema item. */
+const FINDING_SCHEMA: JSONSchema = {
     type: 'object',
     // additionalProperties:false on every object is required by provider strict
     // tool use / structured output modes. Harmless in best-effort mode; optional
     // properties are still allowed.
     additionalProperties: false,
     properties: {
-        reasoning: { type: 'string' },
-        suggestions: {
-            type: 'array',
-            items: {
-                type: 'object',
-                additionalProperties: false,
-                properties: {
-                    relevantFile: { type: 'string' },
-                    language: { type: 'string' },
-                    label: {
-                        type: 'string',
-                        enum: ['bug', 'security', 'performance'],
-                    },
-                    suggestionContent: { type: 'string' },
-                    existingCode: { type: 'string' },
-                    improvedCode: { type: 'string' },
-                    oneSentenceSummary: {
-                        type: 'string',
-                        description: TITLE_PROMPT_SPEC,
-                    },
-                    relevantLinesStart: { type: 'number' },
-                    relevantLinesEnd: { type: 'number' },
-                    severity: {
-                        type: 'string',
-                        enum: ['critical', 'high', 'medium', 'low'],
-                    },
-                    confidence: { type: 'number' },
-                    ruleUuid: { type: 'string' },
-                },
-                required: [
-                    'relevantFile',
-                    'suggestionContent',
-                    'existingCode',
-                    'improvedCode',
-                    'oneSentenceSummary',
-                ],
-            },
+        relevantFile: { type: 'string' },
+        language: { type: 'string' },
+        label: {
+            type: 'string',
+            enum: ['bug', 'security', 'performance'],
         },
+        suggestionContent: { type: 'string' },
+        existingCode: { type: 'string' },
+        improvedCode: { type: 'string' },
+        oneSentenceSummary: {
+            type: 'string',
+            description: TITLE_PROMPT_SPEC,
+        },
+        relevantLinesStart: { type: 'number' },
+        relevantLinesEnd: { type: 'number' },
+        severity: {
+            type: 'string',
+            enum: ['critical', 'high', 'medium', 'low'],
+        },
+        confidence: { type: 'number' },
+        ruleUuid: { type: 'string' },
+    },
+    required: [
+        'relevantFile',
+        'suggestionContent',
+        'existingCode',
+        'improvedCode',
+        'oneSentenceSummary',
+    ],
+};
+
+/** JSON schema for submitResult — mirrors the legacy _findingsSchema. */
+const SUBMIT_RESULT_SCHEMA: JSONSchema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+        reasoning: { type: 'string' },
+        suggestions: { type: 'array', items: FINDING_SCHEMA },
     },
     required: ['reasoning', 'suggestions'],
 };
@@ -149,12 +153,38 @@ export const submitResultTool: AgentTool = {
     execute: async () => ({ output: 'submitted' }),
 };
 
-/** submitResult with `revisesSuggestionId` on each finding (#2039/#2020).
+/** The report tool. No-op execute, like submitResult: the runner captures
+ *  each call's input (`AgentSpec.reportToolNames`). A run cut short, because
+ *  its model failed and a fallback took over or every model failed, keeps
+ *  what was reported here. Exported for the overhead estimator, like
+ *  submitResultTool. */
+export const reportFindingTool: AgentTool = {
+    name: FINDER_REPORT_TOOL,
+    description:
+        'Record one finding as soon as you have confirmed it, then keep investigating. Recorded findings are kept even if the review is interrupted, and need not be repeated in submitResult.',
+    inputSchema: FINDING_SCHEMA,
+    execute: async () => ({ output: 'recorded' }),
+};
+
+/** A finding schema with `revisesSuggestionId` (#2039/#2020). */
+function withRevisionProperty(finding: any): any {
+    return {
+        ...finding,
+        properties: {
+            ...finding.properties,
+            revisesSuggestionId: { type: 'string' },
+        },
+    };
+}
+
+/** submitResult and reportFinding with `revisesSuggestionId` on each finding.
  *  Offered only when the PR has earlier suggestions: a first-round review sends
- *  exactly the tool it always did, so this change cannot move its recall. */
+ *  exactly the tools it always does. */
 function withRevisionField(tool: AgentTool): AgentTool {
     const schema = tool.inputSchema as any;
-    const items = schema.properties.suggestions.items;
+    if (tool.name === FINDER_REPORT_TOOL) {
+        return { ...tool, inputSchema: withRevisionProperty(schema) };
+    }
     return {
         ...tool,
         inputSchema: {
@@ -163,13 +193,9 @@ function withRevisionField(tool: AgentTool): AgentTool {
                 ...schema.properties,
                 suggestions: {
                     ...schema.properties.suggestions,
-                    items: {
-                        ...items,
-                        properties: {
-                            ...items.properties,
-                            revisesSuggestionId: { type: 'string' },
-                        },
-                    },
+                    items: withRevisionProperty(
+                        schema.properties.suggestions.items,
+                    ),
                 },
             },
         },
@@ -205,6 +231,9 @@ export function buildFinderAgentSpec(params: BuildFinderSpecParams): AgentSpec {
     const doneTool = params.acceptsRevisions
         ? withRevisionField(submitResultTool)
         : submitResultTool;
+    const reportTool = params.acceptsRevisions
+        ? withRevisionField(reportFindingTool)
+        : reportFindingTool;
     // Enable strict/structured tool calling on the done-tool for strict-capable
     // models (Gemini VALIDATED mode) so the findings payload can't be omitted or
     // emitted as prose. Best-effort otherwise. NOT enabled for Anthropic — see
@@ -214,6 +243,7 @@ export function buildFinderAgentSpec(params: BuildFinderSpecParams): AgentSpec {
     const toolsForModel = (modelId: string | undefined) =>
         new InMemoryToolRegistry([
             ...params.tools.list(),
+            { ...reportTool, strict: supportsStrictTools(modelId) },
             { ...doneTool, strict: supportsStrictTools(modelId) },
         ]);
     const tools = toolsForModel(params.modelId);
@@ -248,8 +278,58 @@ export function buildFinderAgentSpec(params: BuildFinderSpecParams): AgentSpec {
         // RunState.artifacts. Stopping ON submitResult is the CompletionGatePolicy's
         // doneToolName concern — same tool, distinct roles.
         resultToolName: FINDER_DONE_TOOL,
+        reportToolNames: [FINDER_REPORT_TOOL],
+        // Every finder tool is a read, so a fallback can pick the review up
+        // where a failed model left it.
+        onFailover: 'continue',
+        continuation: (progress) =>
+            finderContinuation(progress, params.coverageLedger),
         providerOptions: params.providerOptions,
     };
+}
+
+/** Longest finding title quoted in the hand-over. */
+const CONTINUATION_TITLE_CHARS = 140;
+
+/**
+ * The hand-over turn for a fallback that takes over a finder run: the findings
+ * already reported (kept, so not to be reported again) and the changed code
+ * not yet read, from the coverage ledger.
+ */
+export function finderContinuation(
+    progress: ContinuationProgress,
+    ledger: ProgressLedger,
+): string {
+    const reported = progress.artifacts
+        .filter((a) => a.type === FINDER_REPORT_TOOL)
+        .map((a) => a.payload as Partial<FinderSuggestion> | undefined)
+        .filter((f): f is Partial<FinderSuggestion> => !!f?.relevantFile)
+        .map((f) => {
+            const lines =
+                f.relevantLinesStart != null
+                    ? `:${f.relevantLinesStart}${f.relevantLinesEnd != null && f.relevantLinesEnd !== f.relevantLinesStart ? `-${f.relevantLinesEnd}` : ''}`
+                    : '';
+            const title = (f.oneSentenceSummary ?? f.suggestionContent ?? '')
+                .replace(/\s+/g, ' ')
+                .slice(0, CONTINUATION_TITLE_CHARS);
+            return `- ${f.relevantFile}${lines}: ${title}`;
+        });
+    const debt = ledger.debtNote();
+    return [
+        `The model reviewing this pull request stopped after ${progress.steps.length} steps, and you are taking over the same review. You have ${progress.stepsLeft} steps.`,
+        '',
+        ...(reported.length
+            ? [
+                  'Findings already reported. They are kept: do not report them again.',
+                  ...reported,
+              ]
+            : ['No findings were reported yet.']),
+        '',
+        debt ??
+            'Every changed hunk has already been read. Use the steps left to check what is still unconfirmed, then finish.',
+        '',
+        `Record each further finding with ${FINDER_REPORT_TOOL} as soon as you confirm it, and call ${FINDER_DONE_TOOL} when you are done.`,
+    ].join('\n');
 }
 
 /** Extract findings from a finished run by reading the run's materialized
@@ -258,6 +338,49 @@ export function buildFinderAgentSpec(params: BuildFinderSpecParams): AgentSpec {
  *  is the finder's final output. Falls back to [] if the agent never finalized
  *  (budget-exhausted). No hand re-scan of steps — that is the runner's job. */
 export function extractFindings(
+    state: RunState,
+    telemetryMetadata?: { organizationId?: string },
+): {
+    reasoning: string;
+    suggestions: FinderSuggestion[];
+} {
+    const submitted = extractSubmittedFindings(state, telemetryMetadata);
+    const reported = reportedFindings(state, telemetryMetadata);
+    if (!reported.length) {
+        return submitted;
+    }
+    if ((state as any).__findingsOutcome === 'no-artifact') {
+        (state as any).__findingsOutcome = 'reported-only';
+    }
+    // Reported first: the order the model confirmed them in. submitResult
+    // may repeat them; the merge key drops the repeats.
+    return mergeSuggestions(
+        { reasoning: '', suggestions: reported },
+        submitted,
+    );
+}
+
+/** The findings recorded with reportFinding, each validated like a
+ *  submitResult item. */
+function reportedFindings(
+    state: RunState,
+    telemetryMetadata?: { organizationId?: string },
+): FinderSuggestion[] {
+    const payloads = state.artifacts
+        .filter((a) => a.type === FINDER_REPORT_TOOL)
+        .map((a) => a.payload);
+    if (!payloads.length) {
+        return [];
+    }
+    const clean = sanitizeFindingsResult(
+        { reasoning: '', suggestions: payloads as any },
+        telemetryMetadata,
+    );
+    return (clean?.suggestions ?? []) as FinderSuggestion[];
+}
+
+/** The findings of the run's last submitResult, with the text fallbacks. */
+function extractSubmittedFindings(
     state: RunState,
     // Purely for the [LLM_ENVELOPE] logs sanitizeFindingsResult emits — see
     // that function's own doc comment for why this is an untyped inline

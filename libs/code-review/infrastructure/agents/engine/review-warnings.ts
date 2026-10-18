@@ -41,7 +41,10 @@ export type ReviewWarningKind =
     /** Findings were dropped because the file they named is not in the PR. */
     | 'SUGGESTIONS_DROPPED_PATH_MISMATCH'
     /** Some Kody Rules checks failed to run; the others still posted. */
-    | 'KODY_RULES_PARTIAL';
+    | 'KODY_RULES_PARTIAL'
+    /** Every model failed partway through an agent's run. The findings it had
+     *  already reported were kept; the rest of its review was not done. */
+    | 'REVIEW_INCOMPLETE';
 
 export type ReviewWarningReason =
     | 'small_context_window'
@@ -94,13 +97,43 @@ export function buildProviderFallbackWarning(params: {
     usedModel: string;
     agentName?: string;
     skipped?: boolean;
+    /** The main model failed partway and the fallback finished its work. */
+    continued?: boolean;
 }): ReviewWarning {
+    const detail = params.skipped
+        ? `main provider ${params.failedModel} skipped (circuit open); review ran on fallback ${params.usedModel}`
+        : params.continued
+          ? `main provider ${params.failedModel} failed partway; fallback ${params.usedModel} finished the review`
+          : `main provider ${params.failedModel} failed; review ran on fallback ${params.usedModel}`;
     return {
         kind: 'PROVIDER_FALLBACK',
         reason: 'provider_failover',
         contextWindowTokens: 0,
         modelName: params.usedModel,
-        detail: `main provider ${params.failedModel} ${params.skipped ? 'skipped (circuit open)' : 'failed'}; review ran on fallback ${params.usedModel}`,
+        detail,
+        agentName: params.agentName,
+    };
+}
+
+/**
+ * Every model failed partway through an agent's run, and the review kept the
+ * findings the agent had reported before it stopped. Without this the review
+ * reads as complete. `kept` may be 0 only if a caller chooses to report it;
+ * the provider emits it when it keeps findings.
+ */
+export function buildReviewIncompleteWarning(params: {
+    modelName: string;
+    agentName: string;
+    kept: number;
+    steps: number;
+    error: string;
+}): ReviewWarning {
+    return {
+        kind: 'REVIEW_INCOMPLETE',
+        reason: 'provider_failover',
+        contextWindowTokens: 0,
+        modelName: params.modelName,
+        detail: `${params.agentName}: every model failed after ${params.steps} steps (${params.error}); kept the ${params.kept} finding(s) reported before that`,
         agentName: params.agentName,
     };
 }
@@ -126,6 +159,7 @@ export function withFallbackWarnings(
                 failedModel: f.failedModel,
                 usedModel: f.usedModel,
                 skipped: f.hops?.[0]?.outcome === 'skipped',
+                continued: !!f.hops?.some((h) => h.continued),
             }),
         ),
     ]);
