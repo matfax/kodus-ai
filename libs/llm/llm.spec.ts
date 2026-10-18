@@ -298,6 +298,115 @@ describe('LLM.run — agent-loop failover guard', () => {
     });
 });
 
+describe('LLM.run — continuing a loop on the next entry (continueFrom)', () => {
+    const env = { ...process.env };
+    afterEach(() => {
+        process.env = { ...env };
+    });
+
+    const leg = {
+        messages: [
+            { role: 'user', content: 'go' },
+            { role: 'user', content: 'take over' },
+        ],
+        maxSteps: 2,
+    };
+    /** The primary runs one step, then fails. */
+    const failsAfterAStep = (params: any) => {
+        params.loop.onStepFinish?.({ step: 1 });
+        return Promise.reject(transientErr());
+    };
+    const loopReq = (continueFrom: jest.Mock) => ({
+        byokConfig: slotWithFallback,
+        runName: 'r',
+        messages: [{ role: 'user', content: 'go' }],
+        loop: { tools: {}, maxSteps: 5, continueFrom },
+    });
+
+    it('runs the next entry on the leg the runner built', async () => {
+        const continueFrom = jest.fn().mockReturnValue(leg);
+        runAgentLoopCall
+            .mockImplementationOnce(failsAfterAStep)
+            .mockResolvedValueOnce('finished-on-fallback');
+
+        await expect(LLM.run(loopReq(continueFrom) as any)).resolves.toBe(
+            'finished-on-fallback',
+        );
+
+        expect(continueFrom).toHaveBeenCalledWith({
+            failedModel: 'primary',
+            nextModel: 'fallback',
+            chainIndex: 1,
+            reason: 'TRANSIENT',
+        });
+        const [first, second] = runAgentLoopCall.mock.calls.map(([p]) => p);
+        expect(first.messages).toEqual([{ role: 'user', content: 'go' }]);
+        expect(first.loop.maxSteps).toBe(5);
+        expect(second.byokConfig.model).toBe('fallback');
+        expect(second.messages).toEqual(leg.messages);
+        expect(second.loop.maxSteps).toBe(2);
+        // The seam stays with LLM.run; the executor never sees it.
+        expect(second.loop.continueFrom).toBeUndefined();
+    });
+
+    it('ends the run when the runner has no leg to offer', async () => {
+        const continueFrom = jest.fn().mockReturnValue(undefined);
+        runAgentLoopCall.mockImplementationOnce(failsAfterAStep);
+
+        await expect(LLM.run(loopReq(continueFrom) as any)).rejects.toThrow('5xx');
+        expect(runAgentLoopCall).toHaveBeenCalledTimes(1);
+    });
+
+    it('LLM_LOOP_CONTINUE=off puts back the old guard', async () => {
+        process.env.LLM_LOOP_CONTINUE = 'off';
+        const continueFrom = jest.fn().mockReturnValue(leg);
+        runAgentLoopCall.mockImplementationOnce(failsAfterAStep);
+
+        await expect(LLM.run(loopReq(continueFrom) as any)).rejects.toThrow('5xx');
+        expect(continueFrom).not.toHaveBeenCalled();
+        expect(runAgentLoopCall).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps the deadline armed after a step, except on the last entry', async () => {
+        delete process.env.LLM_FAILOVER_ROUND_TRIP_DEADLINE_MS;
+        const active: boolean[][] = [];
+        const record = (params: any) => {
+            const seen = [params.roundTrip.isActive()];
+            params.loop.onStepFinish?.({ step: 1 });
+            seen.push(params.roundTrip.isActive());
+            active.push(seen);
+        };
+        runAgentLoopCall
+            .mockImplementationOnce((params: any) => {
+                record(params);
+                return Promise.reject(transientErr());
+            })
+            .mockImplementationOnce((params: any) => {
+                record(params);
+                return Promise.resolve('ok');
+            });
+
+        await LLM.run(loopReq(jest.fn().mockReturnValue(leg)) as any);
+        expect(active).toEqual([
+            [true, true],
+            [false, false],
+        ]);
+    });
+
+    it('leaves the deadline off after a step when continuation is switched off', async () => {
+        delete process.env.LLM_FAILOVER_ROUND_TRIP_DEADLINE_MS;
+        process.env.LLM_LOOP_CONTINUE = 'off';
+        const active: boolean[] = [];
+        runAgentLoopCall.mockImplementationOnce((params: any) => {
+            params.loop.onStepFinish?.({ step: 1 });
+            active.push(params.roundTrip.isActive());
+            return Promise.resolve('ok');
+        });
+        await LLM.run(loopReq(jest.fn()) as any);
+        expect(active).toEqual([false]);
+    });
+});
+
 describe('LLM.run — per-attempt round-trip deadline', () => {
     const env = { ...process.env };
     afterEach(() => {

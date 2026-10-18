@@ -32,6 +32,7 @@ import {
 
 import type { NormalizedModel } from '@libs/llm/byok-config';
 import type { ByokRoundTrip } from '@libs/llm/byok-model-wrapper';
+import type { ResumeInfo } from '@libs/llm/model-failover';
 import { resolveModelConfig } from '@libs/llm/model-invocation';
 import { agentModelIdentity } from '@libs/llm/model-identity';
 import { applyCacheBreakpoints } from '@libs/llm/prompt-cache';
@@ -67,8 +68,8 @@ export interface AgentLoopSeams {
      *  primary is rejected by an OpenAI fallback). `LLM.run` calls it once per
      *  failover attempt with that attempt's model id (undefined for the managed
      *  default) and sends its result instead of `tools`. Per attempt is safe
-     *  because a cascade only happens before the first step, so every attempt
-     *  starts a fresh loop. */
+     *  because every attempt starts a fresh `generateText` loop, including one
+     *  that continues a failed attempt's work (`continueFrom`). */
     toolsForModel?: (modelId: string | undefined) => Record<string, unknown>;
     /** Hard ceiling on steps — `stepCountIs(maxSteps)` is appended to stopWhen. */
     maxSteps: number;
@@ -79,6 +80,21 @@ export interface AgentLoopSeams {
     prepareStep?: (opts: any) => unknown;
     /** Per-step observation hook (policy `onStepFinish` + step collection). */
     onStepFinish?: (event: any) => unknown;
+    /**
+     * Continue on the next chain entry after an attempt that had already run
+     * steps failed. Without it such a failure ends the run, because restarting
+     * would repeat work the runner has already counted. The runner returns the
+     * messages and step budget that pick up where the failed attempt stopped,
+     * or undefined to end the run. Called at most once per failed attempt,
+     * and only when the failure would otherwise cascade.
+     */
+    continueFrom?: (failure: ResumeInfo) => AgentLoopLeg | undefined;
+}
+
+/** What one attempt of a loop runs: the conversation and its step budget. */
+export interface AgentLoopLeg {
+    messages: ModelMessage[];
+    maxSteps: number;
 }
 
 export interface AgentLoopParams {
@@ -128,8 +144,9 @@ export interface AgentLoopParams {
     temperature?: number;
     /** The failover attempt's round-trip deadline (set by `LLM.run`): each
      *  provider request is bounded by it while the attempt can still cascade,
-     *  i.e. a next chain entry exists and no step has run. Once a step ran the
-     *  loop is exactly as without it — SDK retries, undici's bound and the
+     *  i.e. a next chain entry exists and either no step has run or the loop
+     *  can continue on that entry (`continueFrom`). Otherwise the loop is
+     *  exactly as without it — SDK retries, undici's bound and the
      *  AGENT_TIMEOUT_MS ceiling. */
     roundTrip?: ByokRoundTrip;
 }
