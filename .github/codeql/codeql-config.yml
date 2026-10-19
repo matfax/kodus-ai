@@ -1,0 +1,8 @@
+name: kodus-ai CodeQL config
+
+# Enterprise code under its own license: not ours to change, so not ours to
+# analyse. Default setup cannot exclude paths, which is why this repository
+# runs CodeQL from .github/workflows/codeql.yml instead.
+paths-ignore:
+    - libs/ee
+    - apps/web/src/features/ee

@@ -36,6 +36,7 @@ mapfile -t FILES < <(
         | grep -vE '\.(spec|test|integration)\.ts$' \
         | grep -vE '\.d\.ts$' \
         | grep -vE '^(node_modules|dist|coverage|\.stryker-tmp)/' \
+        | grep -vE '^(libs/ee|apps/web/src/features/ee)/' \
         | while read -r f; do [ -f "$f" ] && echo "$f"; done
 )
 

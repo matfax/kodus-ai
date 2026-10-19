@@ -22,3 +22,4 @@ allowBuilds:
 overrides:
   'diff@>=6.0.0 <8.0.3': '8.0.3'
   jimp: '1.6.1'
+  'shell-quote@<1.11.0': '1.11.0'
