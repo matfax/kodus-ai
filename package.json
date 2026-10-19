@@ -98,6 +98,8 @@
         "start:local:api": "cd apps/api && node dist/main.js",
         "start:local:worker": "cd apps/worker && node dist/main.js",
         "test": "API_NODE_ENV=test NODE_OPTIONS=--max-old-space-size=4096 jest --forceExit --runInBand --detectOpenHandles --config jest.config.ts",
+        "test:unit": "API_NODE_ENV=test NODE_OPTIONS=--max-old-space-size=4096 jest --forceExit --maxWorkers=3 --workerIdleMemoryLimit=2GB --config jest.unit.config.ts",
+        "test:integration": "API_NODE_ENV=test NODE_OPTIONS=--max-old-space-size=4096 jest --forceExit --runInBand --detectOpenHandles --config jest.integration.config.ts",
         "test:rbac": "API_NODE_ENV=test NODE_OPTIONS=--max-old-space-size=4096 jest --config jest.config.ts --no-coverage --testPathPatterns=\"permissionsAbility|role-policies|route-coverage|endpoint-authorization|authorization\"",
         "permissions:matrix": "ts-node scripts/permissions/generate-matrix.ts",
         "permissions:matrix:check": "ts-node scripts/permissions/generate-matrix.ts --check",
