@@ -1,5 +1,8 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { ValidateNewCommitsStage } from './validate-new-commits.stage';
+import {
+    newerLiveHead,
+    ValidateNewCommitsStage,
+} from './validate-new-commits.stage';
 import { AUTOMATION_EXECUTION_SERVICE_TOKEN } from '@libs/automation/domain/automationExecution/contracts/automation-execution.service';
 import { PULL_REQUEST_MANAGER_SERVICE_TOKEN } from '@libs/code-review/domain/contracts/PullRequestManagerService.contract';
 import { CodeReviewPipelineContext } from '../context/code-review-pipeline.context';
@@ -401,5 +404,70 @@ describe('ValidateNewCommitsStage', () => {
             // only persists when present, so undefined keeps DB clean.
             expect(result.orphanedBaseCommit).toBeUndefined();
         });
+    });
+
+    // The diff is read against the PR's live head, so the pin (anchor and
+    // recorded commit) must be the live head too, even when the webhook that
+    // started the run is older: a catch-up, or a job that waited in the queue.
+    describe('the head the review pins', () => {
+        const allCommits = [
+            { sha: 'KNOWN_SHA', parents: [{ sha: 'BASE' }] },
+            { sha: 'NEW_1', parents: [{ sha: 'KNOWN_SHA' }] },
+            { sha: 'NEW_2', parents: [{ sha: 'NEW_1' }] },
+        ];
+
+        beforeEach(() => {
+            mockAutomationExecutionService.findLatestExecutionByFilters.mockResolvedValue(
+                {
+                    uuid: 'exec-prev',
+                    dataExecution: { lastAnalyzedCommit: { sha: 'KNOWN_SHA' } },
+                },
+            );
+            mockPullRequestManagerService.getNewCommitsSinceLastExecution.mockResolvedValue(
+                allCommits,
+            );
+        });
+
+        const withHead = (sha: string) =>
+            ({
+                ...context,
+                pullRequest: { number: 1, head: { sha, ref: 'feature' } },
+            }) as CodeReviewPipelineContext;
+
+        it("moves an older webhook head to the PR's live head", async () => {
+            const result = await stage.execute(withHead('NEW_1'));
+
+            expect(result.pullRequest.head).toEqual({
+                sha: 'NEW_2',
+                ref: 'feature',
+            });
+            expect(result.prCommits.map((c) => c.sha)).toEqual([
+                'NEW_1',
+                'NEW_2',
+            ]);
+        });
+
+        it('leaves a head that is already live', async () => {
+            const result = await stage.execute(withHead('NEW_2'));
+
+            expect(result.pullRequest.head.sha).toBe('NEW_2');
+        });
+    });
+});
+
+describe('newerLiveHead', () => {
+    const commits = [{ sha: 'a' }, { sha: 'b' }, { sha: 'c' }] as any[];
+
+    it('is the live head when the context head is an older commit of the PR', () => {
+        expect(newerLiveHead('a', commits)).toBe('c');
+    });
+
+    it.each([
+        ['the context head is the live head', 'c', commits],
+        ['the PR no longer contains the context head', 'gone', commits],
+        ['there is no context head', undefined, commits],
+        ['there are no commits', 'a', []],
+    ])('is undefined when %s', (_label, head, list) => {
+        expect(newerLiveHead(head, list)).toBeUndefined();
     });
 });

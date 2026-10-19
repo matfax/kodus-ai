@@ -68,6 +68,7 @@ describe('CodeReviewJobProcessorService — rate-limit gate integration', () => 
             { check: gateCheck } as any,
             { next: jest.fn(), defer: jest.fn() } as any,
             { notifyCommandReviewRefused: jest.fn() } as any,
+            { isCovered: jest.fn().mockResolvedValue(false) } as any,
         );
 
         mockJobRepository.findOne.mockResolvedValue(makeJob());

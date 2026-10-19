@@ -44,6 +44,8 @@ describe('CodeReviewJobProcessorService — review.failed emit', () => {
             { next: jest.fn(), defer: jest.fn() } as any,
             // codeReviewHandlerService — not used by notifyReviewFailed
             { notifyCommandReviewRefused: jest.fn() } as any,
+            // reviewCatchUpService — not used by notifyReviewFailed
+            { isCovered: jest.fn() } as any,
         );
     });
 

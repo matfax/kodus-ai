@@ -1,12 +1,12 @@
 import type { CommandReviewFeedbackTarget } from '@libs/code-review/infrastructure/adapters/services/codeReviewHandlerService.service';
 
 /**
- * Thrown when a user-issued `@kody review` cannot start because another run
- * already holds the PR — either the distributed lock or an in-flight
- * execution row.
+ * Thrown when a review cannot start because another run already holds the
+ * PR — either the distributed lock or an in-flight execution row.
  *
- * Only command origins throw. An automation losing the same race is
- * genuinely redundant and is still dropped, quietly.
+ * A user-issued `@kody review` throws it as a `command`; an automatic review
+ * (a push) as a `catch-up`, unless catch-ups are switched off
+ * (`reviewCatchUpEnabled`), in which case the push is dropped quietly.
  *
  * Returning instead of throwing is what made the request vanish (#1700):
  * the caller chain ignores the returned string and marks the job COMPLETED,
@@ -19,6 +19,13 @@ export class PrReviewInProgressError extends Error {
 
     /** Which gate refused it — for logging and metrics only. */
     readonly gate: 'lock' | 'execution';
+
+    /** A person's `@kody review`, or a push that waits to catch up. */
+    readonly kind: 'command' | 'catch-up';
+
+    /** The head commit the refused push carried, when known: a catch-up
+     *  whose push an earlier review already covered is not run again. */
+    readonly pushHeadSha?: string;
 
     /** Everything needed to answer the user on the PR, if we give up. */
     readonly target: CommandReviewFeedbackTarget;
@@ -36,14 +43,18 @@ export class PrReviewInProgressError extends Error {
         target: CommandReviewFeedbackTarget;
         holderVisibleUntil?: Date;
         message?: string;
+        kind?: 'command' | 'catch-up';
+        pushHeadSha?: string;
     }) {
         super(
             params.message ??
                 `Code review already in progress for PR#${params.target?.pullRequest?.number}`,
         );
         this.gate = params.gate;
+        this.kind = params.kind ?? 'command';
         this.target = params.target;
         this.holderVisibleUntil = params.holderVisibleUntil;
+        this.pushHeadSha = params.pushHeadSha;
     }
 }
 

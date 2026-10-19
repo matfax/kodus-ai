@@ -51,6 +51,17 @@ export class PrReviewDeferralService {
      */
     private static readonly MAX_DEFERRALS = 26;
 
+    /**
+     * A catch-up waits through the holder's whole visibility window (30
+     * minutes at most, at up to 60s per wait), and longer when another run
+     * takes the PR next. This only stops a PR that never frees up.
+     */
+    private static readonly MAX_CATCH_UP_DEFERRALS = 45;
+
+    /** A catch-up's last wait ends this long after the holder's deadline, so
+     *  the retry finds the gate blind to the holder. */
+    private static readonly DEADLINE_MARGIN_MS = 1_000;
+
     private static readonly METADATA_KEY = 'prReviewDeferral';
 
     constructor(
@@ -100,9 +111,50 @@ export class PrReviewDeferralService {
         return { deferredCount, delayMs };
     }
 
+    /**
+     * The next wait for a catch-up: a push refused while a review of the
+     * same PR ran. Unlike a command it never gives up at the holder's
+     * deadline: once the gate stops seeing the holder, a push arriving then
+     * would start a review, so the catch-up's last wait ends there and its
+     * retry runs. Null only past MAX_CATCH_UP_DEFERRALS.
+     */
+    nextCatchUp(
+        job: IWorkflowJob,
+        holderVisibleUntil?: Date,
+    ): PrReviewDeferral | null {
+        const deferredCount = this.getDeferredCount(job) + 1;
+
+        if (deferredCount > PrReviewDeferralService.MAX_CATCH_UP_DEFERRALS) {
+            return null;
+        }
+
+        let delayMs = Math.min(
+            PrReviewDeferralService.BASE_DELAY_MS *
+                2 ** Math.max(0, deferredCount - 1),
+            PrReviewDeferralService.MAX_DELAY_MS,
+        );
+
+        if (holderVisibleUntil) {
+            const untilBlind = holderVisibleUntil.getTime() - Date.now();
+            delayMs = Math.min(
+                delayMs,
+                Math.max(untilBlind, 0) +
+                    PrReviewDeferralService.DEADLINE_MARGIN_MS,
+            );
+        }
+
+        return { deferredCount, delayMs };
+    }
+
+    /**
+     * Put the job back to PENDING until the deferral's time. `metadata` is
+     * merged into the job's metadata (a catch-up stores what it needs on
+     * wake-up there).
+     */
     async defer(
         job: IWorkflowJob,
         deferral: PrReviewDeferral,
+        metadata: Record<string, unknown> = {},
     ): Promise<void> {
         const nextAttemptAt = new Date(Date.now() + deferral.delayMs);
 
@@ -113,6 +165,7 @@ export class PrReviewDeferralService {
                 'Waiting for the review already running on this PR to finish',
             metadata: {
                 ...(job.metadata || {}),
+                ...metadata,
                 [PrReviewDeferralService.METADATA_KEY]: {
                     deferredCount: deferral.deferredCount,
                     delayMs: deferral.delayMs,
@@ -141,7 +194,7 @@ export class PrReviewDeferralService {
         });
 
         this.logger.warn({
-            message: `Deferred code review command for job ${job.id} — PR is busy`,
+            message: `Deferred code review for job ${job.id} — PR is busy`,
             context: PrReviewDeferralService.name,
             metadata: {
                 jobId: job.id,

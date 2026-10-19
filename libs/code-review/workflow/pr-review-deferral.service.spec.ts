@@ -110,6 +110,58 @@ describe('PrReviewDeferralService', () => {
         });
     });
 
+    describe('nextCatchUp', () => {
+        afterEach(() => jest.useRealTimers());
+
+        it('backs off like a command', () => {
+            expect(service.nextCatchUp(withDeferrals(0))).toEqual({
+                deferredCount: 1,
+                delayMs: BASE_DELAY_MS,
+            });
+            expect(service.nextCatchUp(withDeferrals(5))).toEqual({
+                deferredCount: 6,
+                delayMs: MAX_DELAY_MS,
+            });
+        });
+
+        it('keeps waiting past the point where a command gives up', () => {
+            expect(service.next(withDeferrals(MAX_DEFERRALS))).toBeNull();
+            expect(
+                service.nextCatchUp(withDeferrals(MAX_DEFERRALS)),
+            ).not.toBeNull();
+        });
+
+        it("ends its last wait just past the holder's deadline instead of giving up", () => {
+            jest.useFakeTimers().setSystemTime(
+                new Date('2026-10-19T10:00:00Z'),
+            );
+            const deadline = new Date('2026-10-19T10:00:20Z');
+
+            expect(service.next(withDeferrals(3), deadline)).toBeNull();
+            expect(service.nextCatchUp(withDeferrals(3), deadline)).toEqual({
+                deferredCount: 4,
+                delayMs: 21_000,
+            });
+        });
+
+        it('retries right after the margin when the deadline has passed', () => {
+            jest.useFakeTimers().setSystemTime(
+                new Date('2026-10-19T10:00:00Z'),
+            );
+            expect(
+                service.nextCatchUp(
+                    withDeferrals(0),
+                    new Date('2026-10-19T09:59:00Z'),
+                ),
+            ).toEqual({ deferredCount: 1, delayMs: 1_000 });
+        });
+
+        it('stops only on a PR that never frees up', () => {
+            expect(service.nextCatchUp(withDeferrals(44))).not.toBeNull();
+            expect(service.nextCatchUp(withDeferrals(45))).toBeNull();
+        });
+    });
+
     describe('defer', () => {
         it('reschedules the job instead of failing it', async () => {
             await service.defer(makeJob(), {
@@ -144,6 +196,25 @@ describe('PrReviewDeferralService', () => {
 
             const [, update] = jobRepository.update.mock.calls[0];
             expect(update.metadata.somethingElse).toBe('keep-me');
+        });
+
+        it('merges the metadata a catch-up keeps for its wake-up', async () => {
+            await service.defer(
+                makeJob({ metadata: { somethingElse: 'keep-me' } }),
+                { deferredCount: 1, delayMs: BASE_DELAY_MS },
+                { prReviewCatchUp: { pushHeadSha: 'sha-2' } },
+            );
+
+            const [, update] = jobRepository.update.mock.calls[0];
+            expect(update.metadata).toEqual(
+                expect.objectContaining({
+                    somethingElse: 'keep-me',
+                    prReviewCatchUp: { pushHeadSha: 'sha-2' },
+                    prReviewDeferral: expect.objectContaining({
+                        deferredCount: 1,
+                    }),
+                }),
+            );
         });
 
         it('publishes through the outbox so the relay re-delivers it', async () => {

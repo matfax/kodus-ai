@@ -111,6 +111,7 @@ describe('CodeReviewJobProcessorService — AbortSignal propagation', () => {
             { check: jest.fn().mockResolvedValue(undefined) } as any,
             { next: jest.fn(), defer: jest.fn() } as any,
             { notifyCommandReviewRefused: jest.fn() } as any,
+            { isCovered: jest.fn().mockResolvedValue(false) } as any,
         );
 
         (mockJobRepository.findOne as jest.Mock).mockResolvedValue(makeJob());
