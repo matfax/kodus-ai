@@ -32,6 +32,7 @@ export type {
     AgentSpec,
     AgentRunner,
     AgentRunInput,
+    ContinuationProgress,
     SubAgentFactory,
 } from './agent.contract';
 export type {

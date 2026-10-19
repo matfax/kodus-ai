@@ -585,6 +585,7 @@ describe('C. transport / fail-safe', () => {
     it('row 31: finishReason "error" result → reconstructed throw carries message + statusCode + responseBody', async () => {
         runLoopMock.mockResolvedValue(
             makeHarnessResult({
+                findings: { suggestions: [] },
                 finishReason: 'error',
                 errorMessage: 'model not found',
                 errorName: 'NotFoundError',
@@ -602,6 +603,29 @@ describe('C. transport / fail-safe', () => {
         expect(thrown.message).toBe('model not found');
         expect(thrown.statusCode).toBe(404);
         expect(thrown.responseBody).toBe('{"error":"unknown model"}');
+    });
+
+    // Row 31b — the run reported findings before every model failed: they are
+    // kept, and the review is marked incomplete instead of failing (R17).
+    it('row 31b: finishReason "error" with reported findings → keeps them and warns REVIEW_INCOMPLETE', async () => {
+        runLoopMock.mockResolvedValue(
+            makeHarnessResult({
+                finishReason: 'error',
+                errorMessage: 'Gateway Timeout',
+                errorStatus: 504,
+            }),
+        );
+        const out = await newAgent().execute(makeInput());
+        expect(out.suggestions).toHaveLength(1);
+        expect(out.warnings).toContainEqual(
+            expect.objectContaining({
+                kind: 'REVIEW_INCOMPLETE',
+                reason: 'provider_failover',
+                detail: expect.stringContaining(
+                    'every model failed after 5 steps (Gateway Timeout); kept the 1 finding(s)',
+                ),
+            }),
+        );
     });
 
     // Row 32 — empty success (content:'' / finish stop) is a legitimate empty

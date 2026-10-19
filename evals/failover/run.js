@@ -42,7 +42,12 @@ const ENV = {
     LLM_CIRCUIT_MODE: 'enforce',
     LLM_CIRCUIT_FAILURE_THRESHOLD: '1',
     LLM_CIRCUIT_OPEN_MS: String(OPEN_MS),
+    LLM_LOOP_CONTINUE: 'on',
 };
+// A finder run's caller budget: a mid-loop stall the run cannot move past
+// ends here instead of at AGENT_TIMEOUT_MS, so the negative control fails
+// in seconds rather than hanging.
+const REVIEW_BUDGET_MS = 5 * DEADLINE_MS;
 
 // A UUID, like a real org: the breaker keys BYOK calls per org.
 const ORG = '00000000-0000-4000-8000-0000000fa110';
@@ -62,14 +67,16 @@ async function main() {
         return 2;
     }
 
-    // What the faulty server answers each model with, and how many requests
-    // each model got (for the n-th-request faults).
+    // What the faulty server answers each model with, how many requests each
+    // model got (for the n-th-request faults), and the bodies it was sent.
     const faults = new Map(CASES.map((c) => [modelOf(c.id), c.fault]));
     const seen = new Map();
+    const bodies = new Map();
     const faulty = await startFakeLlmServer({
         fault: (body) => {
             const n = (seen.get(body.model) || 0) + 1;
             seen.set(body.model, n);
+            bodies.set(body.model, [...(bodies.get(body.model) || []), body]);
             const fault = faults.get(body.model) ?? null;
             return typeof fault === 'function' ? fault(n) : fault;
         },
@@ -89,6 +96,9 @@ async function main() {
     const { recordModelFailovers, readFailoverHops } = require('../../libs/llm/model-failover.ts');
     const { circuitKeyFor, providerCircuit } = require('../../libs/llm/provider-circuit.ts');
     const { isCallerAbortOrBudget } = require('../../libs/llm/error-classifier.ts');
+    const { AiSdkAgentRunner } = require('../../libs/agent-harness/infrastructure/ai-sdk/ai-sdk-agent-runner.ts');
+    const { InMemoryToolRegistry } = require('../../libs/agent-harness/infrastructure/tools/in-memory-tool-registry.ts');
+    const { buildFinderAgentSpec, extractFindings } = require('../../libs/code-review/infrastructure/agents/core/finder.agent.ts');
     const { tool } = require('ai');
     const { z } = require('zod');
 
@@ -101,16 +111,21 @@ async function main() {
         { id: 'faulty', provider: 'openai_compatible', apiKey: encrypt('fake'), settings: { baseURL: faulty.url } },
         { id: 'healthy', provider: 'openai_compatible', apiKey: encrypt('fake'), settings: { baseURL: TIER0[MODEL].baseURL } },
     ];
-    const configFor = (id, chain = []) => ({
-        version: 2,
-        credentials,
-        models: [
-            { id, credentialId: 'faulty', model: modelOf(id) },
-            ...chain.map((entry) => ({ id: entry.id, credentialId: 'faulty', model: modelOf(entry.id) })),
-            { id: FALLBACK_ID, credentialId: 'healthy', model: MODEL },
-        ],
-        routing: { defaultModelId: id, fallbackModelId: chain[0]?.id ?? FALLBACK_ID, fallbackModelIds: [...chain.map((entry) => entry.id), FALLBACK_ID] },
-    });
+    // `healthy: false` leaves the eval-fake fallback out, so the chain is only
+    // the faulty server's models.
+    const configFor = (id, chain = [], { healthy = true } = {}) => {
+        const tail = [...chain.map((entry) => entry.id), ...(healthy ? [FALLBACK_ID] : [])];
+        return {
+            version: 2,
+            credentials,
+            models: [
+                { id, credentialId: 'faulty', model: modelOf(id) },
+                ...chain.map((entry) => ({ id: entry.id, credentialId: 'faulty', model: modelOf(entry.id) })),
+                { id: FALLBACK_ID, credentialId: 'healthy', model: MODEL },
+            ],
+            routing: { defaultModelId: id, fallbackModelId: tail[0], fallbackModelIds: tail },
+        };
+    };
 
     // One exploration tool: the scripted model calls it, then answers, so a
     // completed call is a two-step loop.
@@ -119,10 +134,57 @@ async function main() {
         maxSteps: 4,
     };
 
+    // A finder run as the review runs it: the real finder spec (reportFinding,
+    // submitResult, the policies, the hand-over) on the real runner, routed to
+    // the case's primary. The coverage ledger is a stub with a fixed debt note,
+    // so the hand-over's "still unread" part is a known string.
+    const UNREAD = 'WARM pending (1/1): readFile src/app.ts lines 10-20';
+    const ledger = {
+        markFromToolCall: () => undefined,
+        summary: () => ({ totalTargets: 1, pendingTargets: 1, criticalTotal: 0, criticalPending: 0 }),
+        debtNote: () => UNREAD,
+    };
+    const finderTools = new InMemoryToolRegistry([
+        { name: 'readFile', description: 'Read a file', inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }, execute: async () => ({ output: 'file body' }) },
+    ]);
+    const REVIEW_MAX_STEPS = 6;
+
     const ctx = {
         DEADLINE_MS,
         OPEN_MS,
+        UNREAD,
+        REVIEW_MAX_STEPS,
         sleep,
+        bodiesOf: (id) => bodies.get(modelOf(id)) || [],
+        requestsOf: (id) => seen.get(modelOf(id)) || 0,
+        review: async (id, { chain = [], env = {}, healthy = true } = {}) => {
+            for (const entry of chain) faults.set(modelOf(entry.id), entry.fault);
+            const saved = Object.fromEntries(Object.keys(env).map((k) => [k, process.env[k]]));
+            Object.assign(process.env, env);
+            const before = seen.get(modelOf(id)) || 0;
+            const started = Date.now();
+            try {
+                const { slot } = resolveTaskSlot(configFor(id, chain, { healthy }), LLM_TASK.codeReview);
+                const runner = new AiSdkAgentRunner(slot, { organizationId: ORG });
+                const spec = buildFinderAgentSpec({ systemPrompt: 'Find bugs in the changed code.', modelId: slot.model, tools: finderTools, coverageLedger: ledger, maxSteps: REVIEW_MAX_STEPS });
+                const { value: state, failovers } = await recordModelFailovers(() =>
+                    runner.run(spec, { prompt: 'Review src/app.ts' }, { runId: `failover-eval.${id}`, signal: AbortSignal.timeout(REVIEW_BUDGET_MS) }),
+                );
+                return {
+                    state,
+                    findings: extractFindings(state).suggestions,
+                    hops: failovers[0]?.hops ?? [],
+                    answeredBy: failovers[0]?.usedModel ?? (state.status === 'error' ? null : 'primary'),
+                    ms: Date.now() - started,
+                    primaryRequests: (seen.get(modelOf(id)) || 0) - before,
+                };
+            } finally {
+                for (const [k, v] of Object.entries(saved)) {
+                    if (v === undefined) delete process.env[k];
+                    else process.env[k] = v;
+                }
+            }
+        },
         setFault: (id, fault) => faults.set(modelOf(id), fault),
         circuitState: (id) => {
             const { slot } = resolveTaskSlot(configFor(id), LLM_TASK.codeReview);

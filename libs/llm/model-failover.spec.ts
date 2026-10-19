@@ -57,6 +57,7 @@ jest.mock('@libs/llm/error-classifier', () => {
 
 import { ProviderDeadlineError } from './provider-deadline-error';
 import {
+    loopContinueEnabled,
     providerTimeoutCascadeEnabled,
     readAttemptedSlot,
     readFailoverHops,
@@ -64,6 +65,7 @@ import {
     runWithModelFailover,
     shouldFailoverToNextModel,
     type FailoverAttemptControl,
+    type ResumeInfo,
 } from './model-failover';
 import type { NormalizedModel } from './byok-config';
 import { providerCircuit } from './provider-circuit';
@@ -548,6 +550,142 @@ describe('runWithModelFailover — an N-entry chain', () => {
         ).toEqual([
             [0, 'AUTH_INVALID', 'B'],
             [1, 'TRANSIENT', 'C'],
+        ]);
+    });
+});
+
+describe('loopContinueEnabled', () => {
+    it.each([
+        [undefined, true],
+        ['on', true],
+        ['off', false],
+        [' OFF ', false],
+        ['false', false],
+        ['0', false],
+    ])('LLM_LOOP_CONTINUE=%p → %p', (value, expected) => {
+        expect(loopContinueEnabled({ LLM_LOOP_CONTINUE: value })).toBe(expected);
+    });
+});
+
+describe('runWithModelFailover — continuing an attempt that ran steps', () => {
+    const opts = { runName: 'test' };
+
+    /** An attempt that ran a step (marked unsafe), then failed with `cat`. */
+    const failsMidLoop =
+        (cat: string, extra: Record<string, unknown> = {}) =>
+        async (_s: unknown, c: FailoverAttemptControl) => {
+            c.markUnsafeToRetry();
+            throw err(cat, extra);
+        };
+
+    it('moves on to the next entry when resumeAfterSteps accepts, and marks the hop', async () => {
+        const runOne = jest
+            .fn()
+            .mockImplementationOnce(failsMidLoop('TRANSIENT'))
+            .mockResolvedValueOnce('finished on B');
+        const resumeAfterSteps = jest.fn((_info: ResumeInfo) => true);
+
+        const { value, failovers } = await recordModelFailovers(() =>
+            runWithModelFailover([slot('A'), slot('B')], runOne, {
+                ...opts,
+                resumeAfterSteps,
+            }),
+        );
+
+        expect(value).toBe('finished on B');
+        expect(resumeAfterSteps).toHaveBeenCalledTimes(1);
+        expect(resumeAfterSteps).toHaveBeenCalledWith({
+            failedModel: 'A',
+            nextModel: 'B',
+            chainIndex: 1,
+            reason: 'TRANSIENT',
+        });
+        expect(failovers).toHaveLength(1);
+        expect(failovers[0].hops).toEqual([
+            expect.objectContaining({
+                model: 'A',
+                outcome: 'failed',
+                continued: true,
+            }),
+        ]);
+    });
+
+    it('ends the run as before when resumeAfterSteps declines', async () => {
+        const runOne = jest.fn(failsMidLoop('TRANSIENT'));
+        await expect(
+            runWithModelFailover([slot('A'), slot('B')], runOne, {
+                ...opts,
+                resumeAfterSteps: () => false,
+            }),
+        ).rejects.toThrow('boom:TRANSIENT');
+        expect(runOne).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+        ['an error that does not cascade', [slot('A'), slot('B')], 'RATE_LIMIT'],
+        ['the last entry', [slot('A')], 'TRANSIENT'],
+    ])('is not asked for %s', async (_label, slots, cat) => {
+        const resumeAfterSteps = jest.fn(() => true);
+        await expect(
+            runWithModelFailover(slots, jest.fn(failsMidLoop(cat)), {
+                ...opts,
+                resumeAfterSteps,
+            }),
+        ).rejects.toThrow(`boom:${cat}`);
+        expect(resumeAfterSteps).not.toHaveBeenCalled();
+    });
+
+    it('is not asked once the caller signal has aborted', async () => {
+        const controller = new AbortController();
+        const resumeAfterSteps = jest.fn(() => true);
+        const runOne = jest.fn(async (_s: unknown, c: FailoverAttemptControl) => {
+            c.markUnsafeToRetry();
+            controller.abort();
+            throw err('TRANSIENT');
+        });
+        await expect(
+            runWithModelFailover([slot('A'), slot('B')], runOne, {
+                ...opts,
+                signal: controller.signal,
+                resumeAfterSteps,
+            }),
+        ).rejects.toThrow('boom:TRANSIENT');
+        expect(resumeAfterSteps).not.toHaveBeenCalled();
+        expect(runOne).toHaveBeenCalledTimes(1);
+    });
+
+    it('is not asked for an attempt that ran no step: that is a plain cascade', async () => {
+        const resumeAfterSteps = jest.fn(() => true);
+        const runOne = jest
+            .fn()
+            .mockRejectedValueOnce(err('TRANSIENT'))
+            .mockResolvedValueOnce('ok');
+        const { failovers } = await recordModelFailovers(() =>
+            runWithModelFailover([slot('A'), slot('B')], runOne, {
+                ...opts,
+                resumeAfterSteps,
+            }),
+        );
+        expect(resumeAfterSteps).not.toHaveBeenCalled();
+        expect(failovers[0].hops[0].continued).toBeUndefined();
+    });
+
+    it('can continue more than once down the chain', async () => {
+        const runOne = jest
+            .fn()
+            .mockImplementationOnce(failsMidLoop('TRANSIENT'))
+            .mockImplementationOnce(failsMidLoop('TRANSIENT', { __providerTimeout: true }))
+            .mockResolvedValueOnce('finished on C');
+        const resumeAfterSteps = jest.fn((_info: ResumeInfo) => true);
+        const out = await runWithModelFailover(
+            [slot('A'), slot('B'), slot('C')],
+            runOne,
+            { ...opts, resumeAfterSteps },
+        );
+        expect(out).toBe('finished on C');
+        expect(resumeAfterSteps.mock.calls.map(([i]) => [i.nextModel, i.reason])).toEqual([
+            ['B', 'TRANSIENT'],
+            ['C', 'provider-timeout'],
         ]);
     });
 });

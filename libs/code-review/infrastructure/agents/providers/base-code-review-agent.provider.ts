@@ -28,6 +28,7 @@ import {
 import { resolveContextWindow } from '@libs/llm/model-context-window';
 import {
     buildPathMismatchWarning,
+    buildReviewIncompleteWarning,
     type ReviewWarning,
 } from '@libs/code-review/infrastructure/agents/engine/review-warnings';
 import { resolveAdaptiveProfile } from '@libs/code-review/infrastructure/agents/engine/adaptive-fit';
@@ -681,9 +682,35 @@ export abstract class BaseCodeReviewAgentProvider {
             // silent "0 suggestions, 0 failures" SUCCESS, masking a provider
             // outage. The thrown message is classified (classifyLLMError) into
             // the end-review comment's failure reason.
+            //
+            // Unless the run had already reported findings before every model
+            // failed: those are kept, and the review is marked incomplete.
             const providerError = providerErrorFromResult(agentResult);
             if (providerError) {
-                throw providerError;
+                const kept = agentResult.findings?.suggestions?.length ?? 0;
+                if (!kept) {
+                    throw providerError;
+                }
+                this.agentLogger.warn({
+                    message: `[AGENT] ${identity.name} failed after ${agentResult.steps} steps; keeping the ${kept} finding(s) it reported`,
+                    context: identity.name,
+                    metadata: {
+                        kept,
+                        steps: agentResult.steps,
+                        error: providerError.message,
+                        organizationId:
+                            input.organizationAndTeamData?.organizationId,
+                    },
+                });
+                agentWarnings.push(
+                    buildReviewIncompleteWarning({
+                        modelName,
+                        agentName: identity.name,
+                        kept,
+                        steps: agentResult.steps,
+                        error: providerError.message,
+                    }),
+                );
             }
 
             const durationMs = Date.now() - startTime;

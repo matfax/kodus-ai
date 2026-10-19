@@ -40,12 +40,15 @@ import {
 } from '@libs/llm/structured-review-call';
 import {
     runAgentLoopCall,
+    type AgentLoopLeg,
     type AgentLoopSeams,
 } from '@libs/llm/agent-loop-call';
 import {
+    loopContinueEnabled,
     roundTripDeadlineFor,
     runWithModelFailover,
     type FailoverAttemptControl,
+    type ResumeInfo,
 } from '@libs/llm/model-failover';
 import type { ByokRoundTrip } from '@libs/llm/byok-model-wrapper';
 import { LLM_CALL_TIMEOUT_MS } from '@libs/llm/llm-call';
@@ -151,22 +154,24 @@ function toExecutorParams(
  *
  * - Tools: `toolsForModel`, when the runner supplied it, builds this attempt's
  *   tool map for its own model, so a chain entry gets tools it can accept.
- * - Failover guard: the FIRST emitted step vetoes failover for the current
- *   attempt. A step's tool calls mutate shared runner state (its step array +
- *   policy progress), so restarting on the fallback would double-count them.
- *   The high-value cascade (a bad/expired key, an unknown model) fails BEFORE
- *   the first step, so it still fires — this only holds back a rare mid-loop
- *   transient.
+ * - Steps: the leg's budget, which is less than the loop's when this attempt
+ *   continues a failed one.
+ * - Failover guard: the FIRST emitted step vetoes a plain restart for the
+ *   current attempt. A step's tool calls mutate shared runner state (its step
+ *   array + policy progress), so restarting on the fallback would double-count
+ *   them. Only `continueFrom` moves such an attempt on, by continuing instead.
  */
 function loopForAttempt(
     loop: AgentLoopSeams,
+    leg: AgentLoopLeg,
     attemptSlot: NormalizedModel | undefined,
     control: FailoverAttemptControl,
 ): AgentLoopSeams {
-    const { toolsForModel, ...seams } = loop;
+    const { toolsForModel, continueFrom: _continueFrom, ...seams } = loop;
     const inner = loop.onStepFinish;
     return {
         ...seams,
+        maxSteps: leg.maxSteps,
         tools: toolsForModel ? toolsForModel(attemptSlot?.model) : loop.tools,
         onStepFinish: (event: unknown) => {
             control.markUnsafeToRetry();
@@ -179,9 +184,9 @@ function loopForAttempt(
  * One attempt's round-trip deadline, handed to the BYOK wrapper.
  *
  * It exists only to buy a cascade, so it is active only while one is possible:
- * a next chain entry exists and (loop mode) no step has run. The last entry,
- * the only entry and every loop step after the first behave exactly as without
- * it. A one-shot caller with a shorter `timeoutMs` than the knob gets that
+ * a next chain entry exists and (loop mode) no step has run or the loop can
+ * continue on that entry. The last entry, the only entry and the steps of a
+ * loop that cannot continue behave exactly as without it. A one-shot caller with a shorter `timeoutMs` than the knob gets that
  * budget as its deadline (`caller-budget`): the call cascades at the budget
  * instead of failing as a plain timeout, but the breaker does not count it.
  *
@@ -190,8 +195,9 @@ function loopForAttempt(
 function roundTripFor(
     slot: NormalizedModel | undefined,
     control: FailoverAttemptControl,
-    callerBudgetMs?: number,
+    opts: { callerBudgetMs?: number; canContinue?: boolean } = {},
 ): ByokRoundTrip {
+    const { callerBudgetMs, canContinue = false } = opts;
     const knob = roundTripDeadlineFor(slot);
     const fromCaller =
         knob !== undefined &&
@@ -200,7 +206,8 @@ function roundTripFor(
     return {
         ms: fromCaller ? callerBudgetMs : knob,
         source: fromCaller ? 'caller-budget' : 'round-trip',
-        isActive: () => control.hasNext && !control.isUnsafe(),
+        isActive: () =>
+            control.hasNext && (canContinue || !control.isUnsafe()),
         onAnswered: () => control.onAnswered(),
     };
 }
@@ -265,14 +272,31 @@ export class LLM {
         // loop seams. Returns the raw result for the runner to map onto RunState.
         if (req.loop) {
             const loop = req.loop;
+            const continueFrom = loopContinueEnabled()
+                ? loop.continueFrom
+                : undefined;
+            // What the next attempt runs. A continuation replaces it with the
+            // leg the runner built from the failed attempt's progress.
+            let leg: AgentLoopLeg = {
+                messages: req.messages ?? [],
+                maxSteps: loop.maxSteps,
+            };
+            const resumeAfterSteps = continueFrom
+                ? (info: ResumeInfo) => {
+                      const next = continueFrom(info);
+                      if (!next) return false;
+                      leg = next;
+                      return true;
+                  }
+                : undefined;
             return runWithModelFailover(
                 attempts,
                 (attemptSlot, control) =>
                     runAgentLoopCall({
                         byokConfig: attemptSlot,
                         system: req.system,
-                        messages: req.messages ?? [],
-                        loop: loopForAttempt(loop, attemptSlot, control),
+                        messages: leg.messages,
+                        loop: loopForAttempt(loop, leg, attemptSlot, control),
                         runName: req.runName,
                         spanName: req.spanName,
                         attrs: attemptAttrs(req.attrs, control),
@@ -285,12 +309,18 @@ export class LLM {
                         signal: req.signal,
                         maxOutputTokens: req.maxOutputTokens,
                         temperature: req.temperature,
-                        roundTrip: roundTripFor(attemptSlot, control),
+                        roundTrip: roundTripFor(attemptSlot, control, {
+                            canContinue: !!continueFrom,
+                        }),
                     }),
                 // The loop's signal is the caller's budget: once it has aborted,
                 // no further chain entry is started on it. One-shot calls carry
                 // no caller signal (toExecutorParams drops it), so none is passed.
-                { ...failoverOpts, signal: req.signal },
+                {
+                    ...failoverOpts,
+                    signal: req.signal,
+                    ...(resumeAfterSteps ? { resumeAfterSteps } : {}),
+                },
             );
         }
 
@@ -309,11 +339,10 @@ export class LLM {
                     byokConfig: attemptSlot,
                     attrs: attemptAttrs(baseParams.attrs, control),
                     hasNextModel: control.hasNext,
-                    roundTrip: roundTripFor(
-                        attemptSlot,
-                        control,
-                        baseParams.timeoutMs ?? LLM_CALL_TIMEOUT_MS,
-                    ),
+                    roundTrip: roundTripFor(attemptSlot, control, {
+                        callerBudgetMs:
+                            baseParams.timeoutMs ?? LLM_CALL_TIMEOUT_MS,
+                    }),
                 };
                 return schema
                     ? runStructuredReviewCall({ ...params, schema })

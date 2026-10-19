@@ -1232,6 +1232,8 @@ const WARNING_KIND_LABEL: Record<ReviewWarningKind, string> = {
     SUGGESTIONS_DROPPED_PATH_MISMATCH:
         "Findings dropped (file not in the pull request)",
     KODY_RULES_PARTIAL: "Some Kody Rules checks failed to run",
+    REVIEW_INCOMPLETE:
+        "Every model failed partway; findings reported before that were kept",
 };
 
 /**

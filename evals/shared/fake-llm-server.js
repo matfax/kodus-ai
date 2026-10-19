@@ -11,11 +11,14 @@
 //   1. forced tool_choice        → call that tool
 //   2. tools offered, no tool result yet in the conversation
 //                                → call one exploration tool (read > grep > first)
-//   3. a done tool is offered (submitResult, submitVerdict, …)
+//   3. a report tool is offered (reportFinding, …) and this conversation has
+//      not called it yet          → call it once, the way a finder records a
+//                                  finding before it finishes
+//   4. a done tool is offered (submitResult, submitVerdict, …)
 //                                → call it with a schema instance, so the
 //                                  engine gets ONE finding/verdict to carry
 //                                  through verify, dedup and scoring
-//   4. otherwise                 → final answer: a schema instance of the
+//   5. otherwise                 → final answer: a schema instance of the
 //                                  requested json_schema, or "{}" as text
 //
 // It does not try to review anything. It proves the harness can drive the real
@@ -37,7 +40,9 @@ const FAULT_MODES = ['504-html', '503', '429', 'hang'];
 const HTML_504 = '<html><head><title>504 Gateway Time-out</title></head><body><center><h1>504 Gateway Time-out</h1></center></body></html>';
 
 const EXPLORATION_PREFERENCE = [/read/i, /grep|search/i, /list|find/i];
-const DONE_TOOL = /^(submit|done|final|finish|report)/i;
+const DONE_TOOL = /^(submit|done|final|finish)/i;
+// A non-terminal tool that records one result and lets the run go on.
+const REPORT_TOOL = /^report/i;
 
 function resolveRef(ref, root) {
     const parts = String(ref).replace(/^#\//, '').split('/');
@@ -107,6 +112,10 @@ function pickTool(tools, name) {
     return tools.find((t) => t.function.name === name);
 }
 
+function calledInConversation(messages, name) {
+    return messages.some((m) => m.role === 'assistant' && (m.tool_calls || []).some((c) => c?.function?.name === name));
+}
+
 function decide(body) {
     const tools = Array.isArray(body.tools) ? body.tools.filter((t) => t?.function?.name) : [];
     const messages = Array.isArray(body.messages) ? body.messages : [];
@@ -118,8 +127,10 @@ function decide(body) {
     }
     if (tools.length && choice !== 'none') {
         const done = tools.find((t) => DONE_TOOL.test(t.function.name));
-        const exploration = tools.filter((t) => t !== done);
+        const report = tools.find((t) => REPORT_TOOL.test(t.function.name));
+        const exploration = tools.filter((t) => t !== done && t !== report);
         if (toolResults === 0 && exploration.length) return { tool: pickExplorationTool(exploration) };
+        if (report && !calledInConversation(messages, report.function.name)) return { tool: report };
         if (done) return { tool: done };
         if (choice === 'required') return { tool: pickExplorationTool(tools) };
     }

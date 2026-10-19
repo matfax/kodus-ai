@@ -67,6 +67,20 @@ export interface FailoverHop {
     outcome: 'failed' | 'skipped';
     reason: FailoverHopReason;
     elapsedMs: number;
+    /** The attempt had already run agent-loop steps, and the next entry
+     *  continued its work instead of starting it over (`resumeAfterSteps`). */
+    continued?: boolean;
+}
+
+/** What `resumeAfterSteps` is told about the attempt that failed mid-loop. */
+export interface ResumeInfo {
+    /** The model whose attempt failed. */
+    failedModel: string;
+    /** The chain entry that will continue the work. */
+    nextModel: string;
+    /** Position of `nextModel` in the runtime chain. */
+    chainIndex: number;
+    reason: FailoverHopReason;
 }
 
 /** A call that failed on one model and was answered by a later one. */
@@ -183,6 +197,18 @@ export function providerTimeoutCascadeEnabled(
     env: Readonly<Record<string, string | undefined>> = process.env,
 ): boolean {
     const raw = env.LLM_PROVIDER_TIMEOUT_CASCADE?.trim().toLowerCase();
+    return !(raw === 'off' || raw === 'false' || raw === '0');
+}
+
+/**
+ * Kill switch for mid-loop continuation. On by default;
+ * `LLM_LOOP_CONTINUE=off` makes an agent-loop attempt that already ran a step
+ * end the run on failure again, as before continuation existed. Read per call.
+ */
+export function loopContinueEnabled(
+    env: Readonly<Record<string, string | undefined>> = process.env,
+): boolean {
+    const raw = env.LLM_LOOP_CONTINUE?.trim().toLowerCase();
     return !(raw === 'off' || raw === 'false' || raw === '0');
 }
 
@@ -417,6 +443,11 @@ function reportAttemptFailure(
  * whose model keeps failing is skipped — recorded as a `circuit-open` hop —
  * unless it is the last, which always runs. The attempt reports its first
  * provider answer and its counted failures back to the breaker.
+ *
+ * An attempt marked unsafe can still move on when the caller passes
+ * `resumeAfterSteps`: it is asked only once the failure would otherwise
+ * cascade, and returning true means the caller has prepared the next attempt
+ * to CONTINUE the work rather than repeat it. The hop is marked `continued`.
  */
 export async function runWithModelFailover<T>(
     slots: Array<NormalizedModel | undefined>,
@@ -424,7 +455,12 @@ export async function runWithModelFailover<T>(
         slot: NormalizedModel | undefined,
         control: FailoverAttemptControl,
     ) => Promise<T>,
-    opts: { runName: string; organizationId?: string; signal?: AbortSignal },
+    opts: {
+        runName: string;
+        organizationId?: string;
+        signal?: AbortSignal;
+        resumeAfterSteps?: (info: ResumeInfo) => boolean;
+    },
 ): Promise<T> {
     const attempts = distinctAttempts(slots);
     const hops: FailoverHop[] = [];
@@ -528,23 +564,35 @@ export async function runWithModelFailover<T>(
         } catch (err) {
             const { category } = classifyLLMError(err);
             const reason = hopReason(err, category);
-            hops.push({
+            const hop: FailoverHop = {
                 model: nameOf(i),
                 chainIndex: i,
                 outcome: 'failed',
                 reason,
                 elapsedMs: Date.now() - startedAt,
-            });
+            };
+            hops.push(hop);
             settled = true;
             reportAttemptFailure(ticket, err);
 
             const callerAborted = !!opts.signal?.aborted;
-            if (
-                isLastEntry ||
-                unsafeToRetry ||
-                callerAborted ||
-                !shouldFailoverToNextModel(err)
-            ) {
+            const cascades =
+                !isLastEntry && !callerAborted && shouldFailoverToNextModel(err);
+            // Asked only when the failure would otherwise cascade: a true answer
+            // means the caller has already set up the continuation.
+            const continued =
+                cascades &&
+                unsafeToRetry &&
+                !!opts.resumeAfterSteps?.({
+                    failedModel: nameOf(i),
+                    nextModel: nameOf(i + 1),
+                    chainIndex: i + 1,
+                    reason,
+                });
+            if (continued) {
+                hop.continued = true;
+            }
+            if (!cascades || (unsafeToRetry && !continued)) {
                 // Terminal failure: no more attempts (or this error must not
                 // cascade). Emit ONE greppable [LLM-ERROR] line here — the single
                 // chokepoint every LLM.run call funnels through — so a failed LLM
@@ -586,13 +634,14 @@ export async function runWithModelFailover<T>(
             // (mirrors llmErrorLogLevel), and the run still succeeds via the
             // fallback — the interesting signal is the SWAP, not an outage.
             logger.warn({
-                message: `${LLM_ERROR_TAG} [model-failover] ${opts.runName}: "${nameOf(i)}" failed (${reason}); cascading to fallback "${nameOf(i + 1)}"`,
+                message: `${LLM_ERROR_TAG} [model-failover] ${opts.runName}: "${nameOf(i)}" failed (${reason}); ${continued ? 'continuing its work on' : 'cascading to'} fallback "${nameOf(i + 1)}"`,
                 context: 'runWithModelFailover',
                 metadata: {
                     runName: opts.runName,
                     organizationId: opts.organizationId,
                     category,
                     reason,
+                    continued,
                     chainIndex: i,
                     fromModelId: attempts[i]?.byokModelId,
                     toModelId: attempts[i + 1]?.byokModelId,

@@ -148,6 +148,20 @@ describe('recent reviews (#2066)', () => {
         expect(line(results, 'reviews.fallback')?.status).toBe('info');
     });
 
+    it('reports reviews that stopped partway because every model failed', async () => {
+        const incomplete = (): ReviewRun => ({
+            ...full(),
+            warningKinds: ['REVIEW_INCOMPLETE'],
+        });
+        const results = await recentReviewsCheck(
+            deps({ list: [...runs(2), ...runs(2, incomplete)] }),
+        ).run(ctx());
+
+        expect(line(results, 'reviews.incomplete')?.title).toBe(
+            '2 of 4 reviews stopped partway because every model failed; the findings found until then were posted.',
+        );
+    });
+
     it('reports the context-window counter-measures as one line', async () => {
         const cut = (): ReviewRun => ({
             ...full(),
