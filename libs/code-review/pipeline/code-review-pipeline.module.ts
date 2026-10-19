@@ -60,6 +60,7 @@ import { PullRequestMessagesModule } from '../modules/pullRequestMessages.module
 import { CodeReviewJobProcessorService } from '../workflow/code-review-job-processor.service';
 import { ByokConcurrencyGateService } from '../workflow/byok-concurrency-gate.service';
 import { PrReviewDeferralService } from '../workflow/pr-review-deferral.service';
+import { ReviewCatchUpService } from '../workflow/review-catch-up.service';
 import { GitHubRateLimitGateService } from '@libs/platform/infrastructure/adapters/services/github/github-rate-limit-gate.service';
 import { RATE_LIMIT_GATE_SERVICE_TOKEN } from '@libs/core/workflow/domain/contracts/rate-limit-gate.service.contract';
 import { ImplementationVerificationProcessor } from '../workflow/implementation-verification.processor';
@@ -136,6 +137,7 @@ import { ReviewOrchestratorService } from '../infrastructure/agents/review-orche
         CodeReviewJobProcessorService,
         ByokConcurrencyGateService,
         PrReviewDeferralService,
+        ReviewCatchUpService,
         DistributedLockService,
         // GitHub rate-limit gate — pre-check before burning slot on a
         // job whose installation bucket is already exhausted. Same

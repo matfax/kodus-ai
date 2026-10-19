@@ -98,10 +98,51 @@ describe('AutomationCodeReviewService', () => {
             },
         );
 
-        it('still drops an automation-triggered run quietly', async () => {
-            await expect(
-                service.run!(makePayload({ origin: undefined })),
-            ).resolves.toBeDefined();
+        // A push refused here used to be dropped: its commits were reviewed
+        // only if another push came. It now waits to catch up.
+        it('raises a push as a catch-up, with the head it carried', async () => {
+            const holderCreatedAt = new Date(Date.now() - 5 * 60_000);
+            automationExecutionService.find.mockResolvedValue([
+                { uuid: 'execution-1', createdAt: holderCreatedAt },
+            ]);
+
+            const error = await service
+                .run!(
+                    makePayload({
+                        origin: undefined,
+                        pullRequest: { number: 42, head: { sha: 'sha-2' } },
+                    }),
+                )
+                .catch((raised) => raised);
+
+            expect(isPrReviewInProgressError(error)).toBe(true);
+            expect(error.kind).toBe('catch-up');
+            expect(error.gate).toBe('lock');
+            expect(error.pushHeadSha).toBe('sha-2');
+            expect(error.holderVisibleUntil).toEqual(
+                new Date(holderCreatedAt.getTime() + 30 * 60_000),
+            );
+        });
+
+        it('raises a command as a command', async () => {
+            const error = await service
+                .run!(makePayload({ origin: 'command' }))
+                .catch((raised) => raised);
+
+            expect(error.kind).toBe('command');
+            expect(error.pushHeadSha).toBeUndefined();
+        });
+
+        it('drops a push quietly with CODE_REVIEW_CATCH_UP=off', async () => {
+            process.env.CODE_REVIEW_CATCH_UP = 'off';
+            try {
+                await expect(
+                    service.run!(makePayload({ origin: undefined })),
+                ).resolves.toBeDefined();
+                expect(automationExecutionService.find).not.toHaveBeenCalled();
+            } finally {
+                delete process.env.CODE_REVIEW_CATCH_UP;
+            }
         });
 
         // Recomputing the deadline from "now" on every retry would let it
@@ -165,10 +206,25 @@ describe('AutomationCodeReviewService', () => {
             expect(error.target.pullRequest).toEqual({ number: 42 });
         });
 
-        it('still drops an automation-triggered run quietly', async () => {
-            await expect(
-                service.run!(makePayload({ origin: undefined })),
-            ).resolves.toBeDefined();
+        it('raises a push as a catch-up', async () => {
+            const error = await service
+                .run!(makePayload({ origin: undefined }))
+                .catch((raised) => raised);
+
+            expect(isPrReviewInProgressError(error)).toBe(true);
+            expect(error.kind).toBe('catch-up');
+            expect(error.gate).toBe('execution');
+        });
+
+        it('drops a push quietly with CODE_REVIEW_CATCH_UP=off', async () => {
+            process.env.CODE_REVIEW_CATCH_UP = 'off';
+            try {
+                await expect(
+                    service.run!(makePayload({ origin: undefined })),
+                ).resolves.toBeDefined();
+            } finally {
+                delete process.env.CODE_REVIEW_CATCH_UP;
+            }
         });
 
         it('releases the lock it acquired', async () => {

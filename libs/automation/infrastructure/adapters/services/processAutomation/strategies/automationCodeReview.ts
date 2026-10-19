@@ -27,6 +27,7 @@ import {
     PrReviewInProgressError,
 } from '@libs/code-review/domain/errors/pr-review-in-progress.error';
 import { describePipelineError } from '@libs/code-review/utils/describe-pipeline-error';
+import { reviewCatchUpEnabled } from '@libs/code-review/domain/review-catch-up';
 
 /**
  * Messages the pipeline sets before it knows the outcome. Reporting one of
@@ -200,8 +201,8 @@ export class AutomationCodeReviewService implements Omit<
             // Recomputing it per retry would let it slide forever, leaving
             // MAX_DEFERRALS as the only stop — safe today only because the
             // lock's TTL is short enough that this path stops firing after a
-            // minute. Only commands defer, so only they pay for the lookup.
-            const lockHolder = this.isCommandOrigin(origin)
+            // minute. Only deferred runs pay for the lookup.
+            const lockHolder = this.defersWhenRefused(origin)
                 ? await this.getActiveExecution(
                       teamAutomationId,
                       pullRequest?.number,
@@ -209,7 +210,7 @@ export class AutomationCodeReviewService implements Omit<
                   )
                 : null;
 
-            this.refuseCommand(
+            this.refuseRun(
                 'lock',
                 payload,
                 this.holderVisibleUntil(lockHolder?.createdAt),
@@ -237,7 +238,7 @@ export class AutomationCodeReviewService implements Omit<
                         pullRequestNumber: pullRequest?.number,
                     },
                 });
-                this.refuseCommand(
+                this.refuseRun(
                     'execution',
                     payload,
                     this.holderVisibleUntil(existingExecution.createdAt),
@@ -352,11 +353,12 @@ export class AutomationCodeReviewService implements Omit<
     }
 
     /**
-     * Both refusal paths drop the run before the pipeline, which is where
-     * every other piece of user feedback is posted. An automation losing
-     * the race is genuinely redundant and stays dropped; a person who typed
-     * `@kody review` gets their request handed back to the job processor to
-     * retry once the PR frees up (#1700).
+     * Both refusal paths stop the run before the pipeline, which is where
+     * every other piece of user feedback is posted. Either way the request
+     * goes back to the job processor to retry once the PR frees up: a person
+     * who typed `@kody review` (#1700), and a push, whose commits the running
+     * review never saw (a catch-up). With catch-ups switched off a push is
+     * dropped quietly, as before.
      */
     /**
      * When the run holding this PR stops being visible to the gate.
@@ -377,7 +379,11 @@ export class AutomationCodeReviewService implements Omit<
         );
     }
 
-    private refuseCommand(
+    private defersWhenRefused(origin: unknown): boolean {
+        return this.isCommandOrigin(origin) || reviewCatchUpEnabled();
+    }
+
+    private refuseRun(
         gate: 'lock' | 'execution',
         payload: Record<string, any>,
         holderVisibleUntil: Date,
@@ -391,12 +397,15 @@ export class AutomationCodeReviewService implements Omit<
             triggerCommentId,
         } = payload;
 
-        if (!this.isCommandOrigin(origin)) {
+        if (!this.defersWhenRefused(origin)) {
             return;
         }
 
+        const isCommand = this.isCommandOrigin(origin);
         throw new PrReviewInProgressError({
             gate,
+            kind: isCommand ? 'command' : 'catch-up',
+            pushHeadSha: isCommand ? undefined : pullRequest?.head?.sha,
             holderVisibleUntil,
             target: {
                 organizationAndTeamData,
