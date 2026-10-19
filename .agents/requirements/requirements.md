@@ -1,6 +1,6 @@
 # Requirements
 
-<!-- reqtracker:v2 next=18 -->
+<!-- reqtracker:v2 next=19 -->
 
 > Tracked automatically from what the user stated or explicitly approved. Suggestions Claude made on its own are not recorded here.
 
@@ -21,3 +21,4 @@
 - [ ] `R15` The issues discussed in the UI are the Kodus issues that remain open after a PR, listed at repo level. `+issues` `2026-10-09`
 - [x] `R16` Model fallback is graceful and reliable, so Claude can serve as another provider. `+llm-provider` `+claude-sdk` `2026-10-16 → met 2026-10-18: confirmed by the user before a commit`
 - [x] `R17` When an agent loop fails partway, findings are saved as they are reported, so a run that moves to the backup model keeps the findings already made and finishes the rest instead of restarting. `+agent` `+llm-provider` `+pr-review` `2026-10-18 → met 2026-10-18: confirmed by the user before a commit`
+- [x] `R18` A push that arrives while a review is running waits and then runs as an incremental review, so reviews are eventually consistent with the PR. `+pr-review` `2026-10-19 → met 2026-10-19: automationCodeReview refuseRun throws a catch-up PrReviewInProgressError for pushes, code-review-job-processor deferCatchUp waits via PrReviewDeferralService nextCatchUp until the holder is gone, then`

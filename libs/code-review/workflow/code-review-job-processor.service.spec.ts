@@ -37,6 +37,7 @@ describe('CodeReviewJobProcessorService', () => {
     let rateLimitGate: { check: jest.Mock };
     let prReviewDeferralService: Record<string, jest.Mock>;
     let codeReviewHandlerService: Record<string, jest.Mock>;
+    let reviewCatchUpService: { isCovered: jest.Mock };
 
     beforeEach(() => {
         jobRepository = {
@@ -57,7 +58,13 @@ describe('CodeReviewJobProcessorService', () => {
         rateLimitGate = { check: jest.fn().mockResolvedValue(undefined) };
         prReviewDeferralService = {
             next: jest.fn().mockReturnValue({ deferredCount: 1, delayMs: 15000 }),
+            nextCatchUp: jest
+                .fn()
+                .mockReturnValue({ deferredCount: 1, delayMs: 15000 }),
             defer: jest.fn().mockResolvedValue(undefined),
+        };
+        reviewCatchUpService = {
+            isCovered: jest.fn().mockResolvedValue(false),
         };
         codeReviewHandlerService = {
             notifyCommandReviewRefused: jest.fn().mockResolvedValue(undefined),
@@ -72,6 +79,7 @@ describe('CodeReviewJobProcessorService', () => {
             rateLimitGate as any,
             prReviewDeferralService as any,
             codeReviewHandlerService as any,
+            reviewCatchUpService as any,
         );
     });
 
@@ -183,6 +191,104 @@ describe('CodeReviewJobProcessorService', () => {
                 expect.objectContaining({ status: JobStatus.FAILED }),
             );
             expect(prReviewDeferralService.defer).not.toHaveBeenCalled();
+        });
+    });
+
+    // A push refused while a review of the same PR ran waits to catch up
+    // instead of being dropped.
+    describe('a refused push (catch-up)', () => {
+        const refusePush = () =>
+            runCodeReviewAutomationUseCase.execute.mockRejectedValue(
+                new PrReviewInProgressError({
+                    gate: 'execution',
+                    kind: 'catch-up',
+                    target: TARGET,
+                    pushHeadSha: 'sha-2',
+                    holderVisibleUntil: new Date('2026-10-19T10:30:00Z'),
+                }),
+            );
+
+        it('waits on the catch-up schedule, keeping what it needs on wake-up', async () => {
+            refusePush();
+            await service.process('job-1');
+
+            expect(prReviewDeferralService.nextCatchUp).toHaveBeenCalledWith(
+                expect.objectContaining({ id: 'job-1' }),
+                new Date('2026-10-19T10:30:00Z'),
+            );
+            expect(prReviewDeferralService.next).not.toHaveBeenCalled();
+            expect(prReviewDeferralService.defer).toHaveBeenCalledWith(
+                expect.objectContaining({ id: 'job-1' }),
+                { deferredCount: 1, delayMs: 15000 },
+                {
+                    prReviewCatchUp: {
+                        target: TARGET,
+                        teamAutomationId: 'team-automation-1',
+                        pushHeadSha: 'sha-2',
+                    },
+                },
+            );
+        });
+
+        it('completes quietly when it can wait no longer: nobody asked for it', async () => {
+            refusePush();
+            prReviewDeferralService.nextCatchUp.mockReturnValue(null);
+            await service.process('job-1');
+
+            expect(jobRepository.update).toHaveBeenCalledWith(
+                'job-1',
+                expect.objectContaining({
+                    status: JobStatus.COMPLETED,
+                    result: { catchUp: 'gave-up' },
+                }),
+            );
+            expect(
+                codeReviewHandlerService.notifyCommandReviewRefused,
+            ).not.toHaveBeenCalled();
+            expect(notificationService.emit).not.toHaveBeenCalled();
+        });
+
+        const wakingCatchUp = () =>
+            makeJob({
+                metadata: {
+                    prReviewCatchUp: {
+                        target: TARGET,
+                        teamAutomationId: 'team-automation-1',
+                        pushHeadSha: 'sha-2',
+                    },
+                },
+            });
+
+        it('on wake-up, does not run a push a later review already covered', async () => {
+            jobRepository.findOne.mockResolvedValue(wakingCatchUp());
+            reviewCatchUpService.isCovered.mockResolvedValue(true);
+            await service.process('job-1');
+
+            expect(reviewCatchUpService.isCovered).toHaveBeenCalledWith(
+                expect.objectContaining({ pushHeadSha: 'sha-2' }),
+            );
+            expect(runCodeReviewAutomationUseCase.execute).not.toHaveBeenCalled();
+            expect(byokConcurrencyGateService.tryEnter).not.toHaveBeenCalled();
+            expect(jobRepository.update).toHaveBeenCalledWith(
+                'job-1',
+                expect.objectContaining({
+                    status: JobStatus.COMPLETED,
+                    result: { catchUp: 'covered' },
+                }),
+            );
+        });
+
+        it('on wake-up, runs the review when the push is not covered yet', async () => {
+            jobRepository.findOne.mockResolvedValue(wakingCatchUp());
+            await service.process('job-1');
+
+            expect(runCodeReviewAutomationUseCase.execute).toHaveBeenCalled();
+        });
+
+        it('checks coverage only for a waking catch-up', async () => {
+            await service.process('job-1');
+
+            expect(reviewCatchUpService.isCovered).not.toHaveBeenCalled();
         });
     });
 

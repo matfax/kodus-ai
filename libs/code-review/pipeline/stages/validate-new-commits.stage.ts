@@ -234,7 +234,37 @@ export class ValidateNewCommitsStage extends BasePipelineStage<CodeReviewPipelin
             },
         });
 
+        // Review the PR as it is now. The diff is read against the PR's live
+        // head, but the pin (the commit the comments anchor on and that is
+        // recorded as analyzed) came from the webhook, which is older when
+        // the run waited: a catch-up, or a job that sat in the queue while
+        // another push landed. A head the PR no longer contains (force-push)
+        // is left alone; the orphaned-base path above owns that case.
+        const liveHeadSha = newerLiveHead(
+            context.pullRequest?.head?.sha,
+            allCommits,
+        );
+        if (liveHeadSha) {
+            this.logger.log({
+                message: `PR#${context.pullRequest.number} moved past the webhook's head; reviewing its live head`,
+                context: this.stageName,
+                metadata: {
+                    organizationAndTeamData: context.organizationAndTeamData,
+                    repository: context.repository.name,
+                    pullRequestNumber: context.pullRequest.number,
+                    webhookHeadSha: context.pullRequest.head.sha,
+                    liveHeadSha,
+                },
+            });
+        }
+
         return this.updateContext(context, (draft) => {
+            if (liveHeadSha) {
+                draft.pullRequest = {
+                    ...draft.pullRequest,
+                    head: { ...draft.pullRequest.head, sha: liveHeadSha },
+                };
+            }
             draft.prCommits = newCommits;
             draft.prAllCommits = allCommits;
             if (lastExecutionResult) {
@@ -432,4 +462,21 @@ export class ValidateNewCommitsStage extends BasePipelineStage<CodeReviewPipelin
 
         return mergedCommitTracker.size === allNewCommitShas.size;
     }
+}
+
+/**
+ * The PR's live head when the context's head is an older commit of the same
+ * PR, else undefined. `commits` is the PR's commit list, oldest first.
+ */
+export function newerLiveHead(
+    contextHeadSha: string | undefined,
+    commits: readonly Commit[] | undefined,
+): string | undefined {
+    const liveHeadSha = commits?.at(-1)?.sha;
+    if (!contextHeadSha || !liveHeadSha || liveHeadSha === contextHeadSha) {
+        return undefined;
+    }
+    return commits?.some((commit) => commit.sha === contextHeadSha)
+        ? liveHeadSha
+        : undefined;
 }
