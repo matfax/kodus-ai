@@ -46,8 +46,9 @@ function generateContent(tokenCount: number, seed = 'file'): string {
     // fraction of that, and the budget cases below stopped exercising a budget.
     //
     // Found by doubling, then bisecting, the line count: about 2·log2(lines)
-    // estimates. Re-estimating after every added line was quadratic and made
-    // this one suite take ~6 minutes of the backend CI run.
+    // estimates, each over a prefix of at most twice the final text, so
+    // O(n log n) work in all. Re-estimating after every added line was O(n²)
+    // and made this one suite take ~6 minutes of the backend CI run.
     if (tokenCount <= 0) return '';
     const lines: string[] = [];
     const contentOf = (count: number): string => {
