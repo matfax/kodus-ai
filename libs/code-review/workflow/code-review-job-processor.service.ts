@@ -25,9 +25,18 @@ import {
 } from '@libs/core/workflow/domain/contracts/rate-limit-gate.service.contract';
 import { isRateLimitError } from '@libs/core/workflow/domain/errors/rate-limit.error';
 import { classifyGitHubError } from '@libs/core/workflow/domain/errors/classify-github-error';
-import { isPrReviewInProgressError } from '@libs/code-review/domain/errors/pr-review-in-progress.error';
+import {
+    isPrReviewInProgressError,
+    type PrReviewInProgressError,
+} from '@libs/code-review/domain/errors/pr-review-in-progress.error';
 import { CodeReviewHandlerService } from '@libs/code-review/infrastructure/adapters/services/codeReviewHandlerService.service';
 import { PrReviewDeferralService } from './pr-review-deferral.service';
+import {
+    readCatchUpState,
+    REVIEW_CATCH_UP_METADATA_KEY,
+    ReviewCatchUpService,
+    type ReviewCatchUpState,
+} from './review-catch-up.service';
 
 @Injectable()
 export class CodeReviewJobProcessorService implements IJobProcessorService {
@@ -44,6 +53,7 @@ export class CodeReviewJobProcessorService implements IJobProcessorService {
         private readonly rateLimitGate: IRateLimitGateService,
         private readonly prReviewDeferralService: PrReviewDeferralService,
         private readonly codeReviewHandlerService: CodeReviewHandlerService,
+        private readonly reviewCatchUpService: ReviewCatchUpService,
         @Optional()
         private readonly metricsCollector?: MetricsCollectorService,
     ) {}
@@ -101,6 +111,27 @@ export class CodeReviewJobProcessorService implements IJobProcessorService {
                 organizationAndTeamData,
                 platformType,
             );
+
+            // A catch-up waking up: if a review that ran in the meantime
+            // already covered its push, there is nothing left to review.
+            const catchUp = readCatchUpState(job);
+            if (
+                catchUp &&
+                (await this.reviewCatchUpService.isCovered(catchUp))
+            ) {
+                this.logger.log({
+                    message: `Catch-up for PR#${catchUp.target.pullRequest.number} already covered by a later review — not running it`,
+                    context: CodeReviewJobProcessorService.name,
+                    metadata: {
+                        jobId,
+                        correlationId,
+                        organizationId: organizationAndTeamData.organizationId,
+                        pushHeadSha: catchUp.pushHeadSha,
+                    },
+                });
+                await this.markCompleted(jobId, { catchUp: 'covered' });
+                return;
+            }
 
             const admission =
                 await this.byokConcurrencyGateService.tryEnter(job);
@@ -256,6 +287,11 @@ export class CodeReviewJobProcessorService implements IJobProcessorService {
             // Dropping it here is what made the request vanish (#1700), so
             // wait for the holder and try again; only once the retry window
             // is spent do we give up, and then we say so on the PR.
+            if (isPrReviewInProgressError(error) && error.kind === 'catch-up') {
+                await this.deferCatchUp(job, error);
+                return;
+            }
+
             if (isPrReviewInProgressError(error)) {
                 const deferral = this.prReviewDeferralService.next(
                     job,
@@ -317,6 +353,48 @@ export class CodeReviewJobProcessorService implements IJobProcessorService {
                 }
             }
         }
+    }
+
+    /**
+     * A push refused because a review of the same PR was running: wait for
+     * that review and run then, so its commits are reviewed even when no
+     * further push comes. Nobody asked for it, so giving up (a PR that never
+     * frees up) is logged, not posted.
+     */
+    private async deferCatchUp(
+        job: IWorkflowJob,
+        error: PrReviewInProgressError,
+    ): Promise<void> {
+        const deferral = this.prReviewDeferralService.nextCatchUp(
+            job,
+            error.holderVisibleUntil,
+        );
+
+        if (!deferral) {
+            this.logger.warn({
+                message: `Giving up on a catch-up review for job ${job.id} — the PR never freed up`,
+                context: CodeReviewJobProcessorService.name,
+                metadata: {
+                    jobId: job.id,
+                    correlationId: job.correlationId,
+                    gate: error.gate,
+                    organizationId:
+                        job.organizationAndTeamData?.organizationId,
+                },
+            });
+            await this.markCompleted(job.id, { catchUp: 'gave-up' });
+            return;
+        }
+
+        const state: ReviewCatchUpState = {
+            target: error.target,
+            teamAutomationId: (job.payload as EnqueueCodeReviewJobInput)
+                ?.teamAutomationId,
+            ...(error.pushHeadSha ? { pushHeadSha: error.pushHeadSha } : {}),
+        };
+        await this.prReviewDeferralService.defer(job, deferral, {
+            [REVIEW_CATCH_UP_METADATA_KEY]: state,
+        });
     }
 
     /**
