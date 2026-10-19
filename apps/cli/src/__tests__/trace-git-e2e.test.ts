@@ -27,6 +27,15 @@ const GIT_IDENTITY = {
     GIT_COMMITTER_EMAIL: 'test@test.invalid',
 };
 
+// vitest.config.ts turns commit signing off through GIT_CONFIG_* entries;
+// hookEnv() starts from an empty env, so forward them explicitly.
+const GIT_CONFIG_OVERRIDES = Object.fromEntries(
+    Object.entries(process.env).filter(
+        (entry): entry is [string, string] =>
+            entry[0].startsWith('GIT_CONFIG_') && entry[1] !== undefined,
+    ),
+);
+
 /**
  * A PATH containing git and the `kodus` shim — and deliberately no agent CLI,
  * so `claude`, `codex`, `gemini` and `cursor-agent` are all absent.
@@ -38,6 +47,7 @@ function hookEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
         NO_UPDATE_NOTIFIER: '1',
         NODE_OPTIONS: '',
         ...GIT_IDENTITY,
+        ...GIT_CONFIG_OVERRIDES,
         ...extra,
     };
 }
