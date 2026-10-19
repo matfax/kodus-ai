@@ -39,21 +39,37 @@ import { applyEdit } from '@morphllm/morphsdk';
 
 /** Generate content of approximately `tokenCount` tokens (1 token ≈ 3.5 chars). */
 function generateContent(tokenCount: number, seed = 'file'): string {
-    // Grows until the estimator AGREES it holds `tokenCount` tokens, rather than
-    // deriving a char count from a ratio the estimator no longer uses. The old
-    // form padded each line with `'x'.repeat(...)`, and BPE folds a run of
+    // The fewest lines the estimator AGREES hold `tokenCount` tokens, rather
+    // than a char count derived from a ratio the estimator no longer uses. The
+    // old form padded each line with `'x'.repeat(...)`, and BPE folds a run of
     // identical characters — so content labelled 10_000 tokens measured a small
     // fraction of that, and the budget cases below stopped exercising a budget.
+    //
+    // Found by doubling, then bisecting, the line count: about 2·log2(lines)
+    // estimates. Re-estimating after every added line was quadratic and made
+    // this one suite take ~6 minutes of the backend CI run.
+    if (tokenCount <= 0) return '';
     const lines: string[] = [];
-    let lineNum = 0;
-    let content = '';
-    while (estimateTokens(content) < tokenCount) {
-        lines.push(
-            `${seed}_L${lineNum++} const value = compute(input, index); // pad`,
-        );
-        content = lines.join('\n');
+    const contentOf = (count: number): string => {
+        while (lines.length < count) {
+            lines.push(
+                `${seed}_L${lines.length} const value = compute(input, index); // pad`,
+            );
+        }
+        return lines.slice(0, count).join('\n');
+    };
+    const holds = (count: number) =>
+        estimateTokens(contentOf(count)) >= tokenCount;
+
+    let enough = 1;
+    while (!holds(enough)) enough *= 2;
+    let tooFew = enough / 2; // 0.5 when one line already holds it
+    while (enough - tooFew > 1) {
+        const middle = Math.floor((tooFew + enough) / 2);
+        if (holds(middle)) enough = middle;
+        else tooFew = middle;
     }
-    return content;
+    return contentOf(enough);
 }
 
 function makeFile(filename: string, fileContent: string): FileChange {
